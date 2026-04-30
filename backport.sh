@@ -228,6 +228,18 @@ finish_backport() {
   echo ">>> Backport PR for #$pr_num created."
 }
 
+# Trigger Mergify backport by posting `@mergify backport <DST_BRANCH>` on the PR.
+cmd_mergify() {
+  local pr_num="${1:-}"
+  [[ -z "$pr_num" ]] && { echo "Usage: $0 mergify <PR_NUMBER> [PR_NUMBER ...]"; exit 1; }
+
+  for pr_num in "$@"; do
+    echo ">>> Commenting '@mergify backport $DST_BRANCH' on PR #$pr_num"
+    gh pr comment "$pr_num" --repo "$REPO" \
+       --body "@mergify backport $DST_BRANCH"
+  done
+}
+
 main() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -236,14 +248,16 @@ main() {
     pending)  cmd_pending  "${1:-}" ;;
     backport) cmd_backport "${1:-}" ;;
     resume)   cmd_resume   "${1:-}" ;;
+    mergify)  cmd_mergify  "$@" ;;
     *)
       cat <<EOF
 Usage:
   $0 diff                         Compare $SRC_BRANCH with $DST_BRANCH
   $0 list-prs [YYYY-MM-DD]        List PRs merged into $SRC_BRANCH (exact base)
   $0 pending  [YYYY-MM-DD]        List PRs not yet present in $DST_BRANCH
-  $0 backport <PR_NUMBER>         Backport one PR to $DST_BRANCH
+  $0 backport <PR_NUMBER>         Backport one PR to $DST_BRANCH (local cherry-pick)
   $0 resume   <PR_NUMBER>         After resolving conflicts: push + open PR
+  $0 mergify  <PR_NUMBER>...      Trigger Mergify backport via PR comment
 EOF
     ;;
   esac
