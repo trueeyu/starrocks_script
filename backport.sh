@@ -52,6 +52,15 @@ already_backported_prs() {
     | sort -u
 }
 
+# "Original PR" numbers referenced by a backport PR title, e.g.
+#   "... (backport #67355)" -> "67355"
+# Catches the case where DST_BRANCH was backported via a sibling branch
+# (e.g. branch-3.5.13 -> branch-3.5-cc) using a different intermediate PR
+# number than the one merged into SRC_BRANCH.
+extract_orig_refs() {
+  grep -Eo '\(backport #[0-9]+\)' <<<"$1" | grep -Eo '[0-9]+'
+}
+
 cmd_diff() {
   ensure_repo
   echo "=== Commits only in $SRC_BRANCH (not in $DST_BRANCH) ==="
@@ -101,6 +110,12 @@ cmd_pending() {
        if [[ -n "$sha" ]] && grep -qx "$sha" <<<"$done_shas"; then continue; fi
        # 3) PR number referenced in a DST_BRANCH commit subject
        if grep -qx "$num" <<<"$done_prs"; then continue; fi
+       # 4) Same upstream PR landed via a sibling branch's backport
+       skip_orig=0
+       for ref in $(extract_orig_refs "$title"); do
+         if grep -qx "$ref" <<<"$done_prs"; then skip_orig=1; break; fi
+       done
+       [[ "$skip_orig" -eq 1 ]] && continue
        echo "#$num  $merged_at  $sha  @$user  $title"
      done
 }
@@ -139,11 +154,19 @@ cmd_backport() {
     echo "PR #$pr_num ($merge_sha) is already reachable from $DST_BRANCH. Skipping."
     exit 0
   fi
+  local done_prs ref
+  done_prs="$(already_backported_prs)"
   if already_backported_shas | grep -qx "$merge_sha" \
-     || already_backported_prs | grep -qx "$pr_num"; then
+     || grep -qx "$pr_num" <<<"$done_prs"; then
     echo "PR #$pr_num appears to be already backported to $DST_BRANCH. Skipping."
     exit 0
   fi
+  for ref in $(extract_orig_refs "$title"); do
+    if grep -qx "$ref" <<<"$done_prs"; then
+      echo "PR #$pr_num references original PR #$ref which is already on $DST_BRANCH. Skipping."
+      exit 0
+    fi
+  done
 
   local backport_branch="backport/${pr_num}-to-${DST_BRANCH}"
   echo ">>> Backporting PR #$pr_num ($merge_sha) -> $DST_BRANCH"
