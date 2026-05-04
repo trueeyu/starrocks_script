@@ -99,9 +99,9 @@ cmd_pending() {
   gh pr list --repo "$REPO" --state merged \
      --search "base:$SRC_BRANCH merged:>=$since" \
      --limit 1000 \
-     --json number,title,mergedAt,author,baseRefName,mergeCommit \
+     --json number,title,mergedAt,author,baseRefName,mergeCommit,changedFiles \
    | jq -r --arg b "$SRC_BRANCH" '
-       .[] | select(.baseRefName==$b)
+       .[] | select(.baseRefName==$b) | select(.changedFiles > 0)
            | "\(.mergeCommit.oid)\t\(.number)\t\(.mergedAt)\t\(.author.login)\t\(.title)"' \
    | while IFS=$'\t' read -r sha num merged_at user title; do
        # 1) Already reachable from DST_BRANCH (shared ancestry / merge / cherry-pick)
