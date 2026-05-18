@@ -104,6 +104,14 @@ cmd_pending() {
        .[] | select(.baseRefName==$b) | select(.changedFiles > 0)
            | "\(.mergeCommit.oid)\t\(.number)\t\(.mergedAt)\t\(.author.login)\t\(.title)"' \
    | while IFS=$'\t' read -r sha num merged_at user title; do
+       # 0) Merge commit itself introduces no diff vs its first parent
+       #    (handles "empty" PRs that GH still reports changedFiles>0 for, e.g.
+       #    true merge commits where the combined diff is empty)
+       if [[ -n "$sha" && "$sha" != "null" ]] \
+          && git rev-parse --verify -q "${sha}^1" >/dev/null 2>&1 \
+          && git diff --quiet "${sha}^1" "$sha" 2>/dev/null; then
+         continue
+       fi
        # 1) Already reachable from DST_BRANCH (shared ancestry / merge / cherry-pick)
        if is_in_dst "$sha"; then continue; fi
        # 2) Cherry-pick `-x` trailer recorded the original SHA
