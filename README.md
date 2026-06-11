@@ -1,8 +1,8 @@
 # starrocks_script
 
-Helper shell scripts for working with [StarRocks](https://github.com/StarRocks/starrocks)
-release branches: backporting PRs across branches and figuring out which
-release branches a PR has already landed on.
+Helper shell scripts for working with [StarRocks](https://github.com/StarRocks/starrocks):
+backporting PRs across branches, figuring out which release branches a PR has
+already landed on, and monitoring a running cluster.
 
 ## Requirements
 
@@ -105,3 +105,20 @@ Env overrides:
 4. The PR title references an original PR via `(backport #N)` and that
    original PR is already on `DST_BRANCH` (covers chained backports through
    sibling branches).
+
+### `mem_alert.sh` — alert when available memory runs low
+
+Polls `/proc/meminfo` on a fixed interval and, once available memory drops
+below a percentage threshold, hits a local BE endpoint to dump a memory
+report, then exits.
+
+```bash
+./mem_alert.sh
+```
+
+By default it checks every second, triggers at 7% available memory, runs
+`curl -XGET http://127.0.0.1:8040/memz`, and appends the output to
+`/data1/log/mem_alert_curl.html`. Edit the config block at the top of the
+script (`THRESHOLD`, `CHECK_INTERVAL`, `CURL_LOG`, `CURL_CMD`) to adjust.
+
+Intended to run on a StarRocks BE/CN node (reads Linux `/proc/meminfo`).
