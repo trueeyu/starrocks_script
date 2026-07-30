@@ -36,6 +36,14 @@ while true; do
 
     if [ "$AVAIL_PCT" -lt "$THRESHOLD" ]; then
         log "⚠️  触发告警！可用内存 ${AVAIL_PCT}% < ${THRESHOLD}%，执行 curl..."
+
+        # 打印 page cache 的 active / inactive 内存（文件页缓存部分）
+        ACTIVE_FILE_KB=$(grep '^Active(file):' /proc/meminfo | awk '{print $2}')
+        INACTIVE_FILE_KB=$(grep '^Inactive(file):' /proc/meminfo | awk '{print $2}')
+        ACTIVE_FILE_MB=$(( ACTIVE_FILE_KB / 1024 ))
+        INACTIVE_FILE_MB=$(( INACTIVE_FILE_KB / 1024 ))
+        log "Page cache - Active(file): ${ACTIVE_FILE_MB} MB, Inactive(file): ${INACTIVE_FILE_MB} MB"
+
         echo "=== $(date '+%Y-%m-%d %H:%M:%S') ===" >> "$CURL_LOG"
         eval "$CURL_CMD" >> "$CURL_LOG" 2>&1
         CURL_EXIT=$?
