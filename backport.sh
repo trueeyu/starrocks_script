@@ -61,6 +61,74 @@ extract_orig_refs() {
   grep -Eo '\(backport #[0-9]+\)' <<<"$1" | grep -Eo '[0-9]+'
 }
 
+# Drop every trailing "(#N)" / "(backport #N)" segment from a subject.
+# A subject can carry several of them, e.g.
+#   "foo (backport #73391) (backport #76969) (#77282)" -> "foo"
+strip_pr_refs() {
+  local s="$1"
+  # Keep the regex in a variable: unquoted inside [[ =~ ]] the backslashes
+  # would be stripped and "\(" would turn into a capture group.
+  local re='^(.*[^[:space:]])[[:space:]]*\((backport[[:space:]]+)?#[0-9]+\)[[:space:]]*$'
+  while [[ "$s" =~ $re ]]; do
+    s="${BASH_REMATCH[1]}"
+  done
+  printf '%s\n' "$s"
+}
+
+# Subject normalizer shared by both sides of the comparison below: drop the
+# trailing PR refs, then keep only lowercased alphanumerics so that bracket,
+# spacing and punctuation churn between a PR title and the commit subject it
+# landed as does not matter.
+NORM_AWK='
+function norm(s) {
+  while (sub(/[ \t]*\((backport[ \t]+)?#[0-9]+\)[ \t]*$/, "", s)) ;
+  gsub(/[^[:alnum:]]/, "", s)
+  return tolower(s)
+}'
+
+normalize_subject() {
+  awk "$NORM_AWK"' { print norm($0) }' <<<"$1"
+}
+
+# "<original PR>\t<normalized subject>" for every DST_BRANCH commit whose
+# subject references an original PR via "(backport #N)".
+already_backported_ref_subjects() {
+  git log "$REMOTE/$DST_BRANCH" --pretty=format:'%s' \
+    | awk "$NORM_AWK"'
+        {
+          subject = $0
+          n = 0
+          rest = subject
+          while (match(rest, /\(backport #[0-9]+\)/)) {
+            seg = substr(rest, RSTART, RLENGTH)
+            gsub(/[^0-9]/, "", seg)
+            refs[++n] = seg
+            rest = substr(rest, RSTART + RLENGTH)
+          }
+          if (n == 0) next
+          key = norm(subject)
+          for (i = 1; i <= n; i++) print refs[i] "\t" key
+        }' \
+    | sort -u
+}
+
+# True if PR <title> looks like the very same change that already landed on
+# DST_BRANCH as a backport of one of the original PRs its title references.
+# Comparing subjects (not just the original PR number) keeps a *revert* of an
+# already-backported PR — whose title references the same original PR — from
+# being mistaken for the backport itself.
+landed_via_sibling_backport() {
+  local title="$1" pairs="$2" ref key
+  key="$(normalize_subject "$title")"
+  for ref in $(extract_orig_refs "$title"); do
+    if grep -qxF "$ref"$'\t'"$key" <<<"$pairs"; then
+      printf '%s\n' "$ref"
+      return 0
+    fi
+  done
+  return 1
+}
+
 cmd_diff() {
   ensure_repo
   echo "=== Commits only in $SRC_BRANCH (not in $DST_BRANCH) ==="
@@ -92,9 +160,10 @@ cmd_pending() {
   local since="${1:-2024-01-01}"
   echo "Pending backports from $SRC_BRANCH -> $DST_BRANCH since $since:"
 
-  local done_shas done_prs
+  local done_shas done_prs done_ref_subjects
   done_shas="$(already_backported_shas)"
   done_prs="$(already_backported_prs)"
+  done_ref_subjects="$(already_backported_ref_subjects)"
 
   gh pr list --repo "$REPO" --state merged \
      --search "base:$SRC_BRANCH merged:>=$since" \
@@ -118,12 +187,11 @@ cmd_pending() {
        if [[ -n "$sha" ]] && grep -qx "$sha" <<<"$done_shas"; then continue; fi
        # 3) PR number referenced in a DST_BRANCH commit subject
        if grep -qx "$num" <<<"$done_prs"; then continue; fi
-       # 4) Same upstream PR landed via a sibling branch's backport
-       skip_orig=0
-       for ref in $(extract_orig_refs "$title"); do
-         if grep -qx "$ref" <<<"$done_prs"; then skip_orig=1; break; fi
-       done
-       [[ "$skip_orig" -eq 1 ]] && continue
+       # 4) Same change landed via a sibling branch's backport (same original
+       #    PR *and* same subject, so a revert of it is still reported)
+       if landed_via_sibling_backport "$title" "$done_ref_subjects" >/dev/null; then
+         continue
+       fi
        echo "#$num  $merged_at  $sha  @$user  $title"
      done
 }
@@ -169,12 +237,10 @@ cmd_backport() {
     echo "PR #$pr_num appears to be already backported to $DST_BRANCH. Skipping."
     exit 0
   fi
-  for ref in $(extract_orig_refs "$title"); do
-    if grep -qx "$ref" <<<"$done_prs"; then
-      echo "PR #$pr_num references original PR #$ref which is already on $DST_BRANCH. Skipping."
-      exit 0
-    fi
-  done
+  if ref="$(landed_via_sibling_backport "$title" "$(already_backported_ref_subjects)")"; then
+    echo "PR #$pr_num is the same change as the backport of #$ref already on $DST_BRANCH. Skipping."
+    exit 0
+  fi
 
   local backport_branch="backport/${pr_num}-to-${DST_BRANCH}"
   echo ">>> Backporting PR #$pr_num ($merge_sha) -> $DST_BRANCH"
@@ -233,10 +299,8 @@ finish_backport() {
   git push -u "$REMOTE" "$backport_branch"
 
   # Strip any trailing "(#NNN)" or "(backport #NNN)" segments to avoid duplication.
-  local clean_title="$title"
-  for _ in 1 2; do
-    clean_title="$(sed -E 's/[[:space:]]*\((backport[[:space:]]+)?#[0-9]+\)[[:space:]]*$//' <<<"$clean_title")"
-  done
+  local clean_title
+  clean_title="$(strip_pr_refs "$title")"
 
   local body
   body="$(printf '%s\n' \

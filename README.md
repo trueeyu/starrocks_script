@@ -109,9 +109,16 @@ Env overrides:
 1. The merge SHA is reachable.
 2. A commit message contains `cherry picked from commit <sha>`.
 3. A commit subject references `(#N)` or `(backport #N)`.
-4. The PR title references an original PR via `(backport #N)` and that
-   original PR is already on `DST_BRANCH` (covers chained backports through
-   sibling branches).
+4. The PR title references an original PR via `(backport #N)`, that original
+   PR is already on `DST_BRANCH`, **and** both subjects match (covers chained
+   backports through sibling branches).
+
+Rule 4 compares subjects — not just the original PR number — so that a
+`[Revert]` of an already-backported PR, whose title references the same
+original PR, is still reported as pending. Subjects are compared with the
+trailing `(#N)` / `(backport #N)` segments removed and everything but
+lowercased alphanumerics stripped, so bracket and spacing churn does not
+matter.
 
 ### `deploy_be.sh` — deploy a locally built `be/bin` + `be/lib` to remote nodes
 
