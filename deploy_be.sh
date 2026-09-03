@@ -1,14 +1,17 @@
 #!/bin/bash
 
 # ============================================================
-# deploy_be.sh - 把本地的 be/bin、be/lib 部署到远端机器
+# deploy_be.sh - 把本地的 bin、lib 部署到远端 BE / CN 节点
+#
+# BE 和 CN 用的是同一个二进制（lib/starrocks_be），目录结构也一致，
+# 差别只在启停脚本、配置文件和 .out 日志的名字，用 -r be|cn 切换。
 #
 # 单台机器的部署流程（在远端执行）：
-#   1. scp bin/ lib/ 到远端临时目录（上传失败则不停 BE）
-#   2. ./bin/stop_be.sh，等待 starrocks_be 进程真正退出
+#   1. scp bin/ lib/ 到远端临时目录（上传失败则不停服务）
+#   2. ./bin/stop_<role>.sh，等待 starrocks_be 进程真正退出
 #   3. 把旧的 bin/lib 移动到备份目录
 #   4. 用新的 bin/lib 覆盖
-#   5. ./bin/start_be.sh --daemon
+#   5. ./bin/start_<role>.sh --daemon
 #   6. 确认进程存活 + HTTP /api/health 正常
 #   7. 任一步失败（且 ROLLBACK=1）自动回滚到备份版本并重新拉起
 #
@@ -18,8 +21,9 @@
 set -uo pipefail
 
 # ---- 配置项（均可用环境变量覆盖）----
-LOCAL_BE="${LOCAL_BE:-./be}"        # 本地 be 目录（需包含 bin/ 和 lib/）
-REMOTE_BE="${REMOTE_BE:-}"          # 远端 be 目录，必填（或用 -d 指定）
+ROLE="${ROLE:-be}"                  # 部署角色: be 或 cn（或用 -r 指定）
+LOCAL_BE="${LOCAL_BE:-./be}"        # 本地目录（需包含 bin/ 和 lib/）
+REMOTE_BE="${REMOTE_BE:-}"          # 远端部署目录，必填（或用 -d 指定）
 HOSTS="${HOSTS:-}"                  # 目标机器，逗号或空格分隔（或用 -H / -f / 位置参数）
 SSH_USER="${SSH_USER:-}"            # ssh 用户名，留空表示用当前用户/ssh config
 SSH_PORT="${SSH_PORT:-}"           # ssh 端口，留空表示默认
@@ -31,7 +35,7 @@ START_TIMEOUT="${START_TIMEOUT:-180}" # 等待启动成功的最长时间（秒�
 STABLE_WAIT="${STABLE_WAIT:-10}"      # 进程起来后再观察多久，防止起来就崩
 FORCE_KILL="${FORCE_KILL:-0}"         # 停止超时后是否 kill -9
 ROLLBACK="${ROLLBACK:-1}"             # 部署失败是否自动回滚
-HEALTH_PORT="${HEALTH_PORT:-auto}"    # BE http 端口；auto=从 be.conf 读取，0=跳过健康检查
+HEALTH_PORT="${HEALTH_PORT:-auto}"    # http 端口；auto=从 <role>.conf 读取，0=跳过健康检查
 BACKUP_KEEP="${BACKUP_KEEP:-5}"       # 远端保留的备份份数
 
 CONTINUE_ON_ERROR=0
@@ -53,8 +57,9 @@ usage() {
 用法: ./deploy_be.sh [选项] [host ...]
 
 选项:
-  -s <dir>    本地 be 目录，需包含 bin/ 和 lib/         (默认 ./be，或 LOCAL_BE)
-  -d <dir>    远端 be 目录（必填，或 REMOTE_BE）
+  -r <role>   部署角色: be 或 cn                        (默认 be，或 ROLE)
+  -s <dir>    本地目录，需包含 bin/ 和 lib/             (默认 ./be，或 LOCAL_BE)
+  -d <dir>    远端部署目录（必填，或 REMOTE_BE）
   -H <hosts>  目标机器，逗号/空格分隔（或 HOSTS，或位置参数）
   -f <file>   从文件读取机器列表，一行一个，# 开头为注释
   -u <user>   ssh 用户名                                (或 SSH_USER)
@@ -71,14 +76,16 @@ usage() {
 示例:
   REMOTE_BE=/data/starrocks/be ./deploy_be.sh -s ~/starrocks/output/be be01 be02
   ./deploy_be.sh -s ./be -d /data/starrocks/be -f hosts.txt -y
+  ./deploy_be.sh -r cn -s ~/starrocks/output/be -d /data/starrocks/cn cn01 cn02
   HEALTH_PORT=0 ./deploy_be.sh -d /data/starrocks/be be01     # 跳过 http 健康检查
 EOF
 }
 
 # ---- 参数解析 ----
 HOST_FILE=""
-while getopts ":s:d:H:f:u:p:ykcnh" opt; do
+while getopts ":r:s:d:H:f:u:p:ykcnh" opt; do
     case "$opt" in
+        r) ROLE="$OPTARG" ;;
         s) LOCAL_BE="$OPTARG" ;;
         d) REMOTE_BE="$OPTARG" ;;
         H) HOSTS="$OPTARG" ;;
@@ -117,22 +124,28 @@ for h in "${HOST_LIST[@]}"; do
         -*) die "选项 $h 必须写在主机名之前，例如: ./deploy_be.sh -d /data/be -c be01 be02" ;;
     esac
 done
-[ -n "$REMOTE_BE" ] || { usage; die "未指定远端 be 目录（-d 或 REMOTE_BE）"; }
+[ -n "$REMOTE_BE" ] || { usage; die "未指定远端部署目录（-d 或 REMOTE_BE）"; }
 case "$REMOTE_BE" in
     /*) ;;
-    *) die "远端 be 目录必须是绝对路径: $REMOTE_BE" ;;
+    *) die "远端部署目录必须是绝对路径: $REMOTE_BE" ;;
+esac
+
+case "$ROLE" in
+    be|cn) ;;
+    *) die "角色只能是 be 或 cn: $ROLE" ;;
 esac
 
 # ---- 检查本地目录 ----
-[ -d "$LOCAL_BE" ] || die "本地 be 目录不存在: $LOCAL_BE"
+# BE 和 CN 共用 lib/starrocks_be，只有启停脚本名不同
+[ -d "$LOCAL_BE" ] || die "本地目录不存在: $LOCAL_BE"
 [ -d "$LOCAL_BE/bin" ] || die "本地缺少目录: $LOCAL_BE/bin"
 [ -d "$LOCAL_BE/lib" ] || die "本地缺少目录: $LOCAL_BE/lib"
-[ -f "$LOCAL_BE/bin/start_be.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/start_be.sh"
-[ -f "$LOCAL_BE/bin/stop_be.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/stop_be.sh"
+[ -f "$LOCAL_BE/bin/start_$ROLE.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/start_$ROLE.sh"
+[ -f "$LOCAL_BE/bin/stop_$ROLE.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/stop_$ROLE.sh"
 [ -f "$LOCAL_BE/lib/starrocks_be" ] || die "本地缺少文件: $LOCAL_BE/lib/starrocks_be"
 
 TS="$(date '+%Y%m%d_%H%M%S')"
-STAGE="/tmp/be_deploy_$TS"
+STAGE="/tmp/${ROLE}_deploy_$TS"
 
 SSH_TARGET_PREFIX=""
 [ -n "$SSH_USER" ] && SSH_TARGET_PREFIX="$SSH_USER@"
@@ -148,6 +161,7 @@ fi
 COPY_SIZE="$(du -shc "$LOCAL_BE/bin" "$LOCAL_BE/lib" 2>/dev/null | tail -1 | awk '{print $1}')"
 
 # ---- 部署计划 ----
+log "部署角色 : $(echo "$ROLE" | tr '[:lower:]' '[:upper:]')  (bin/start_$ROLE.sh, conf/$ROLE.conf, log/$ROLE.out)"
 log "本地目录 : $(cd "$LOCAL_BE" && pwd)  (bin+lib 共 $COPY_SIZE)"
 log "远端目录 : $REMOTE_BE"
 log "目标机器 : ${HOST_LIST[*]}"
@@ -161,7 +175,8 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 if [ "$ASSUME_YES" != 1 ]; then
-    printf '将重启以上 %d 台机器的 BE，确认继续? [y/N] ' "${#HOST_LIST[@]}"
+    printf '将重启以上 %d 台机器的 %s，确认继续? [y/N] ' \
+        "${#HOST_LIST[@]}" "$(echo "$ROLE" | tr '[:lower:]' '[:upper:]')"
     read -r answer
     case "$answer" in
         y|Y|yes|YES) ;;
@@ -179,9 +194,14 @@ cat > "$REMOTE_SH" <<'REMOTE_EOF'
 # 由 deploy_be.sh 上传并在目标机器上执行
 set -uo pipefail
 
-: "${BE_HOME:?BE_HOME 未传入}" "${STAGE:?STAGE 未传入}" "${TS:?TS 未传入}"
+: "${SR_HOME:?SR_HOME 未传入}" "${STAGE:?STAGE 未传入}" "${TS:?TS 未传入}" \
+  "${ROLE:?ROLE 未传入}"
 NEW="$STAGE"          # scp 上传的新版本 bin/ lib/ 就在这里
-BACKUP_DIR="$BE_HOME/deploy_backup/$TS"
+BACKUP_DIR="$SR_HOME/deploy_backup/$TS"
+START_SH="bin/start_$ROLE.sh"
+STOP_SH="bin/stop_$ROLE.sh"
+CONF_FILE="conf/$ROLE.conf"
+OUT_FILE="log/$ROLE.out"
 
 log() {
     echo "  [$(hostname -s) $(date '+%H:%M:%S')] $*"
@@ -192,7 +212,8 @@ die() {
     exit 1
 }
 
-# 属于本 BE_HOME 的 starrocks_be 进程号（同机多实例时不误伤其它实例）
+# 属于本 SR_HOME 的 starrocks_be 进程号。BE 和 CN 是同一个二进制，靠
+# /proc/<pid>/exe、cwd 是否在本目录下区分，同机多实例/多角色都不误伤。
 be_pids() {
     local pids="" p exe cwd
     for p in $(pgrep -x starrocks_be 2>/dev/null); do
@@ -201,7 +222,9 @@ be_pids() {
         if [ -z "$exe" ] && [ -z "$cwd" ]; then
             # 读不到 /proc 信息（权限不足等），保守地当成本实例
             pids="$pids $p"
-        elif [ "${exe#$BE_HOME/}" != "$exe" ] || [ "${cwd#$BE_HOME}" != "$cwd" ]; then
+        elif [ "${exe#$SR_HOME/}" != "$exe" ] \
+            || [ "$cwd" = "$SR_HOME" ] || [ "${cwd#$SR_HOME/}" != "$cwd" ]; then
+            # 比较时带上斜杠，避免 /data/sr/be 误判 /data/sr/be2 的实例
             pids="$pids $p"
         fi
     done
@@ -218,11 +241,12 @@ wait_exit() {
     return 0
 }
 
-# BE http 端口：auto 时从 be.conf 读取，读不到用 8040
+# http 端口：auto 时从 be.conf / cn.conf 读取（两者都叫 be_http_port），
+# 读不到用 8040
 resolve_http_port() {
     local port="$HEALTH_PORT"
     if [ "$port" = "auto" ]; then
-        port="$(grep -E '^[[:space:]]*be_http_port[[:space:]]*=' "$BE_HOME/conf/be.conf" 2>/dev/null \
+        port="$(grep -E '^[[:space:]]*be_http_port[[:space:]]*=' "$SR_HOME/$CONF_FILE" 2>/dev/null \
                 | tail -1 | cut -d= -f2 | tr -d '[:space:]')"
         [ -n "$port" ] || port=8040
     fi
@@ -230,7 +254,7 @@ resolve_http_port() {
 }
 
 dump_be_out() {
-    local out="$BE_HOME/log/be.out"
+    local out="$SR_HOME/$OUT_FILE"
     [ -f "$out" ] || return 0
     log "----- $out 最后 30 行 -----"
     tail -n 30 "$out" | sed 's/^/  | /'
@@ -238,8 +262,8 @@ dump_be_out() {
 }
 
 start_be() {
-    log "启动: ./bin/start_be.sh --daemon"
-    ( cd "$BE_HOME" && ./bin/start_be.sh --daemon )
+    log "启动: ./$START_SH --daemon"
+    ( cd "$SR_HOME" && "./$START_SH" --daemon )
 }
 
 # 等进程起来 -> 观察 STABLE_WAIT -> http 健康检查
@@ -304,15 +328,15 @@ rollback() {
         log "备份不完整，无法回滚，请人工处理: $BACKUP_DIR"
         return 1
     fi
-    ( cd "$BE_HOME" && ./bin/stop_be.sh >/dev/null 2>&1 )
+    ( cd "$SR_HOME" && "./$STOP_SH" >/dev/null 2>&1 )
     if ! wait_exit 60; then
         log "回滚前进程未退出，kill -9 $(be_pids)"
         kill -9 $(be_pids) 2>/dev/null
         sleep 5
     fi
-    rm -rf "$BE_HOME/bin" "$BE_HOME/lib"
-    mv "$BACKUP_DIR/bin" "$BE_HOME/bin" || { log "恢复 bin 失败"; return 1; }
-    mv "$BACKUP_DIR/lib" "$BE_HOME/lib" || { log "恢复 lib 失败"; return 1; }
+    rm -rf "$SR_HOME/bin" "$SR_HOME/lib"
+    mv "$BACKUP_DIR/bin" "$SR_HOME/bin" || { log "恢复 bin 失败"; return 1; }
+    mv "$BACKUP_DIR/lib" "$SR_HOME/lib" || { log "恢复 lib 失败"; return 1; }
     rmdir "$BACKUP_DIR" 2>/dev/null
     start_be
     if verify_be; then
@@ -335,27 +359,27 @@ fail_after_backup() {
     exit 1
 }
 
-# ---- 1. 前置检查（此时还没停 BE）----
-[ -d "$BE_HOME" ] || die "远端目录不存在: $BE_HOME"
-[ -x "$BE_HOME/bin/stop_be.sh" ] || die "缺少可执行文件: $BE_HOME/bin/stop_be.sh"
-[ -x "$BE_HOME/bin/start_be.sh" ] || die "缺少可执行文件: $BE_HOME/bin/start_be.sh"
-[ -d "$BE_HOME/lib" ] || die "缺少目录: $BE_HOME/lib"
+# ---- 1. 前置检查（此时还没停服务）----
+[ -d "$SR_HOME" ] || die "远端目录不存在: $SR_HOME"
+[ -x "$SR_HOME/$STOP_SH" ] || die "缺少可执行文件: $SR_HOME/$STOP_SH（角色是不是选错了?）"
+[ -x "$SR_HOME/$START_SH" ] || die "缺少可执行文件: $SR_HOME/$START_SH（角色是不是选错了?）"
+[ -d "$SR_HOME/lib" ] || die "缺少目录: $SR_HOME/lib"
 
 [ -d "$NEW/bin" ] || die "上传的 bin 目录不存在: $NEW/bin"
 [ -d "$NEW/lib" ] || die "上传的 lib 目录不存在: $NEW/lib"
-[ -f "$NEW/bin/start_be.sh" ] || die "上传内容缺少 bin/start_be.sh"
+[ -f "$NEW/$START_SH" ] || die "上传内容缺少 $START_SH"
 [ -f "$NEW/lib/starrocks_be" ] || die "上传内容缺少 lib/starrocks_be"
 chmod +x "$NEW"/bin/*.sh "$NEW/lib/starrocks_be" 2>/dev/null
 log "待部署的 bin/ lib/ 已就绪于 $NEW"
 
-# ---- 2. 停止 BE 并确认进程退出 ----
+# ---- 2. 停止服务并确认进程退出 ----
 PIDS_BEFORE="$(be_pids)"
 if [ -z "$PIDS_BEFORE" ]; then
-    log "starrocks_be 当前未运行，仍执行一次 stop_be.sh"
+    log "starrocks_be($ROLE) 当前未运行，仍执行一次 $STOP_SH"
 else
-    log "当前 starrocks_be pid=$PIDS_BEFORE"
+    log "当前 starrocks_be($ROLE) pid=$PIDS_BEFORE"
 fi
-( cd "$BE_HOME" && ./bin/stop_be.sh ) || log "stop_be.sh 返回非 0，继续等待进程退出"
+( cd "$SR_HOME" && "./$STOP_SH" ) || log "$STOP_SH 返回非 0，继续等待进程退出"
 
 if ! wait_exit "$STOP_TIMEOUT"; then
     if [ "$FORCE_KILL" = "1" ]; then
@@ -373,28 +397,28 @@ mkdir -p "$BACKUP_DIR" || die "无法创建备份目录: $BACKUP_DIR"
 if [ -e "$BACKUP_DIR/bin" ] || [ -e "$BACKUP_DIR/lib" ]; then
     die "备份目录已有内容，可能是同一时间戳重复部署: $BACKUP_DIR"
 fi
-mv "$BE_HOME/bin" "$BACKUP_DIR/bin" || die "备份 bin 失败"
-if ! mv "$BE_HOME/lib" "$BACKUP_DIR/lib"; then
-    mv "$BACKUP_DIR/bin" "$BE_HOME/bin"
+mv "$SR_HOME/bin" "$BACKUP_DIR/bin" || die "备份 bin 失败"
+if ! mv "$SR_HOME/lib" "$BACKUP_DIR/lib"; then
+    mv "$BACKUP_DIR/bin" "$SR_HOME/bin"
     die "备份 lib 失败，已把 bin 放回原位"
 fi
 log "已备份旧 bin/lib 到 $BACKUP_DIR"
 
 # ---- 4. 覆盖为新版本 ----
-if ! mv "$NEW/bin" "$BE_HOME/bin"; then
-    rm -rf "$BE_HOME/bin"
-    mv "$BACKUP_DIR/bin" "$BE_HOME/bin"
-    mv "$BACKUP_DIR/lib" "$BE_HOME/lib"
+if ! mv "$NEW/bin" "$SR_HOME/bin"; then
+    rm -rf "$SR_HOME/bin"
+    mv "$BACKUP_DIR/bin" "$SR_HOME/bin"
+    mv "$BACKUP_DIR/lib" "$SR_HOME/lib"
     die "写入新 bin 失败，已恢复旧版本"
 fi
-if ! mv "$NEW/lib" "$BE_HOME/lib"; then
+if ! mv "$NEW/lib" "$SR_HOME/lib"; then
     fail_after_backup "写入新 lib 失败"
 fi
 log "新 bin/lib 已就位"
 
 # ---- 5. 启动 ----
 if ! start_be; then
-    fail_after_backup "start_be.sh 返回非 0"
+    fail_after_backup "$START_SH 返回非 0"
 fi
 
 # ---- 6. 确认启动正常 ----
@@ -404,7 +428,7 @@ fi
 
 # ---- 7. 清理旧备份 ----
 if [ "$BACKUP_KEEP" -gt 0 ]; then
-    old="$(ls -1dt "$BE_HOME/deploy_backup"/*/ 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)))"
+    old="$(ls -1dt "$SR_HOME/deploy_backup"/*/ 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)))"
     if [ -n "$old" ]; then
         echo "$old" | while read -r d; do
             log "清理旧备份: $d"
@@ -436,7 +460,7 @@ deploy_one() {
 
     local rc=0
     $SSH_CMD "$target" \
-        "BE_HOME='$REMOTE_BE' STAGE='$STAGE' TS='$TS' \
+        "SR_HOME='$REMOTE_BE' STAGE='$STAGE' TS='$TS' ROLE='$ROLE' \
          STOP_TIMEOUT='$STOP_TIMEOUT' START_TIMEOUT='$START_TIMEOUT' \
          STABLE_WAIT='$STABLE_WAIT' FORCE_KILL='$FORCE_KILL' \
          ROLLBACK='$ROLLBACK' HEALTH_PORT='$HEALTH_PORT' \

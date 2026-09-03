@@ -120,10 +120,14 @@ trailing `(#N)` / `(backport #N)` segments removed and everything but
 lowercased alphanumerics stripped, so bracket and spacing churn does not
 matter.
 
-### `deploy_be.sh` — deploy a locally built `be/bin` + `be/lib` to remote nodes
+### `deploy_be.sh` — deploy a locally built `bin/` + `lib/` to BE / CN nodes
 
-Ships the local `bin/` and `lib/` of a BE build to one or more machines,
-restarting BE safely on each. Runs on Linux; targets must be Linux.
+Ships the local `bin/` and `lib/` of a build to one or more machines,
+restarting the service safely on each. Runs on Linux; targets must be Linux.
+
+BE and CN share the same binary (`lib/starrocks_be`) and the same directory
+layout — only the start/stop scripts, the config file and the `.out` log are
+named differently — so `-r be|cn` (default `be`) switches roles.
 
 ```bash
 # Single node
@@ -132,6 +136,9 @@ REMOTE_BE=/data/starrocks/be ./deploy_be.sh -s ~/starrocks/output/be be01
 # Several nodes, rolling (serial), skip the confirmation prompt
 ./deploy_be.sh -s ./be -d /data/starrocks/be -y be01 be02 be03
 
+# CN nodes — same build output, different role
+./deploy_be.sh -r cn -s ~/starrocks/output/be -d /data/starrocks/cn cn01 cn02
+
 # Read the host list from a file, keep going if a node fails
 ./deploy_be.sh -s ./be -d /data/starrocks/be -c -f hosts.txt
 
@@ -139,36 +146,44 @@ REMOTE_BE=/data/starrocks/be ./deploy_be.sh -s ~/starrocks/output/be be01
 ./deploy_be.sh -s ./be -d /data/starrocks/be -n be01
 ```
 
-Per-node sequence (options must come **before** the host names):
+Per-node sequence (options must come **before** the host names; `<role>` is
+`be` or `cn`):
 
-1. `scp -r` the local `bin/` and `lib/` to `/tmp/be_deploy_<ts>/` on the target
-   (compressed in transit; `SCP_COMPRESS=0` disables) — the upload and its
-   sanity checks happen **before** BE is stopped.
-2. `./bin/stop_be.sh`, then wait until no `starrocks_be` process belonging to
-   this `BE_HOME` is left (matched by `/proc/<pid>/exe` and `cwd`, so other
-   instances on the same host are untouched). Times out after
-   `STOP_TIMEOUT`; `-k` escalates to `kill -9` instead of aborting.
+1. `scp -r` the local `bin/` and `lib/` to `/tmp/<role>_deploy_<ts>/` on the
+   target (compressed in transit; `SCP_COMPRESS=0` disables) — the upload and
+   its sanity checks happen **before** the service is stopped.
+2. `./bin/stop_<role>.sh`, then wait until no `starrocks_be` process belonging
+   to this directory is left (matched by `/proc/<pid>/exe` and `cwd`, so a BE
+   and a CN — or two instances — on the same host do not disturb each other).
+   Times out after `STOP_TIMEOUT`; `-k` escalates to `kill -9` instead of
+   aborting.
 3. Move the old `bin/` and `lib/` to `$REMOTE_BE/deploy_backup/<ts>/`.
 4. Move the new `bin/` and `lib/` into place (whole-directory replacement —
    `conf/`, `storage/`, `log/` are never touched).
-5. `./bin/start_be.sh --daemon`.
+5. `./bin/start_<role>.sh --daemon`.
 6. Verify: process appears within `START_TIMEOUT`, is still alive after
-   `STABLE_WAIT`, and `http://127.0.0.1:<be_http_port>/api/health` returns 200.
+   `STABLE_WAIT`, and `http://127.0.0.1:<be_http_port>/api/health` returns 200
+   (`cn.conf` uses the same `be_http_port` key as `be.conf`).
 7. On any failure from step 4 on, restore the backup and restart the old
-   version (`ROLLBACK=0` to disable), print the tail of `log/be.out`, and exit
-   non-zero. Failure on one node stops the rollout unless `-c` is given.
+   version (`ROLLBACK=0` to disable), print the tail of `log/<role>.out`, and
+   exit non-zero. Failure on one node stops the rollout unless `-c` is given.
+
+If the role does not match the target directory, the missing
+`bin/start_<role>.sh` is caught by the pre-flight check — before anything is
+stopped or moved.
 
 Options:
 
 | Option | Purpose |
 | ------ | ------- |
-| `-s <dir>` | local be dir containing `bin/` and `lib/` (default `./be`) |
-| `-d <dir>` | remote be dir, absolute path (required) |
+| `-r <role>` | `be` or `cn` (default `be`) |
+| `-s <dir>` | local dir containing `bin/` and `lib/` (default `./be`) |
+| `-d <dir>` | remote deploy dir, absolute path (required) |
 | `-H <hosts>` | hosts, comma/space separated |
 | `-f <file>` | host list file, one per line, `#` comments allowed |
 | `-u <user>` / `-p <port>` | ssh user / port |
 | `-y` | skip the confirmation prompt |
-| `-k` | `kill -9` if BE does not exit before `STOP_TIMEOUT` |
+| `-k` | `kill -9` if the process does not exit before `STOP_TIMEOUT` |
 | `-c` | continue with the remaining hosts after a failure |
 | `-n` | dry run: print the plan only |
 
@@ -176,6 +191,7 @@ Env overrides:
 
 | Var | Default | Purpose |
 | --- | ------- | ------- |
+| `ROLE` | `be` | same as `-r` |
 | `LOCAL_BE` | `./be` | same as `-s` |
 | `REMOTE_BE` | _(unset)_ | same as `-d` |
 | `HOSTS` | _(unset)_ | same as `-H` |
@@ -187,7 +203,7 @@ Env overrides:
 | `STABLE_WAIT` | `10` | seconds to watch the new process before declaring success |
 | `FORCE_KILL` | `0` | same as `-k` |
 | `ROLLBACK` | `1` | restore the backup when the new version fails to start |
-| `HEALTH_PORT` | `auto` | `auto` reads `be_http_port` from `conf/be.conf`; `0` skips the check |
+| `HEALTH_PORT` | `auto` | `auto` reads `be_http_port` from `conf/<role>.conf`; `0` skips the check |
 | `BACKUP_KEEP` | `5` | backups kept under `$REMOTE_BE/deploy_backup/` |
 
 ### `mem_alert.sh` — alert when available memory runs low
