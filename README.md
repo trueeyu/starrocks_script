@@ -2,7 +2,7 @@
 
 Helper shell scripts for working with [StarRocks](https://github.com/StarRocks/starrocks):
 backporting PRs across branches, figuring out which release branches a PR has
-already landed on, deploying a locally built BE, and monitoring a running
+already landed on, deploying a locally built BE / CN / FE, and monitoring a running
 cluster.
 
 ## Requirements
@@ -18,9 +18,9 @@ For `pr_branches.sh` and `backport.sh`:
 Both git scripts run inside the starrocks working tree by default, and accept
 `REPO_DIR=/path/to/starrocks` so you can run them from anywhere.
 
-`deploy_be.sh` only needs `ssh` and `scp`, plus passwordless ssh to the target
+`deploy_be.sh` and `deploy_fe.sh` only need `ssh` and `scp`, plus passwordless ssh to the target
 machines — `ssh_copy_id.sh` sets that up (needs `ssh-copy-id`, and `sshpass`
-only for `-P`). `mem_alert.sh` and the remote half of `deploy_be.sh` are Linux-only
+only for `-P`). `mem_alert.sh` and the remote half of the deploy scripts are Linux-only
 (they read `/proc`).
 
 ## Scripts
@@ -213,6 +213,59 @@ Env overrides:
 | `ROLLBACK` | `1` | restore the backup when the new version fails to start |
 | `HEALTH_PORT` | `auto` | `auto` reads `be_http_port` from `conf/<role>.conf`; `0` skips the check |
 | `BACKUP_KEEP` | `5` | backups kept under `$REMOTE_BE/deploy_backup/` |
+
+### `deploy_fe.sh` — deploy a locally built FE to FE nodes
+
+Same shape as `deploy_be.sh` — same options minus `-r`, same staging,
+backup and rollback — adapted to the FE.
+
+```bash
+# Typical use: roll the build out to every FE in fe_hosts.txt, as user sr
+./deploy_fe.sh -s ~/starrocks/output/fe -d /home/disk1/sr/fe -f fe_hosts.txt -u sr
+
+# Print the plan without touching anything
+./deploy_fe.sh -s ~/starrocks/output/fe -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -n
+
+# Hosts on the command line, Leader (fe01) last
+./deploy_fe.sh -s ~/starrocks/output/fe -d /home/disk1/sr/fe -u sr fe02 fe03 fe01
+```
+
+**Order matters.** Hosts are deployed strictly in the order given, and the
+next one is only touched once the previous FE is ready again, so the
+cluster never loses more than one FE at a time. When upgrading versions,
+put Observers first, then Followers, and the **Leader last**: a new-version
+Leader can write journal entries an old-version Follower cannot replay. The
+script does not detect the Leader itself (that needs SQL credentials); check
+`SHOW FRONTENDS` and order the host list accordingly.
+
+Differences from `deploy_be.sh`:
+
+- Deploys `bin/` and `lib/` (required; `lib/starrocks-fe.jar` must exist),
+  plus `webroot/`, `spark-dpp/` and `hive-udf/` when present locally. Each is
+  replaced as a whole directory, so stale jars do not linger. `conf/`,
+  `meta/` and `log/` are never touched.
+- The FE process is found by `com.starrocks.StarRocksFE` on the command line
+  plus `STARROCKS_HOME` in `/proc/<pid>/environ` matching the deploy dir (or,
+  where the environ is unreadable, the pid in `bin/fe.pid`), so other FE
+  instances on the host are left alone.
+- `stop_fe.sh` waits forever by default; the script bounds that with
+  `STOP_TIMEOUT` and still waits for `stop_fe.sh` itself to finish before
+  moving on, so a late `stop_fe.sh` cannot kill the freshly started FE.
+- Readiness is `GET http://127.0.0.1:<http_port>/api/bootstrap` returning
+  `"status":"OK"` — it only does so once the FE has replayed its metadata and
+  can serve, and it needs no auth even with `enable_http_auth`. `http_port`
+  is read from `conf/fe.conf` (default `8030`). `START_TIMEOUT` defaults to
+  600 s since replaying a large image takes a while.
+- `start_fe.sh` needs Java, which a non-login ssh shell often lacks. The
+  script uses `REMOTE_JAVA_HOME` if set, otherwise the `JAVA_HOME` of the FE
+  that was running before the stop, otherwise `JAVA_HOME` from `fe.conf` or
+  `java` on `PATH` — and aborts **before** stopping anything if none works.
+- Only `bin/`/`lib/` etc. are backed up, not `meta/`. If a new version has
+  already rewritten the image, rolling back to an older version may not be
+  able to read it — back up `meta/` yourself before a version upgrade.
+
+Env overrides are the same as `deploy_be.sh` (`LOCAL_FE` / `REMOTE_FE` in
+place of `LOCAL_BE` / `REMOTE_BE`, no `ROLE`), plus `REMOTE_JAVA_HOME`.
 
 ### `ssh_copy_id.sh` — set up passwordless ssh to many hosts
 
