@@ -19,7 +19,8 @@ Both git scripts run inside the starrocks working tree by default, and accept
 `REPO_DIR=/path/to/starrocks` so you can run them from anywhere.
 
 `deploy_be.sh` only needs `ssh` and `scp`, plus passwordless ssh to the target
-machines. `mem_alert.sh` and the remote half of `deploy_be.sh` are Linux-only
+machines — `ssh_copy_id.sh` sets that up (needs `ssh-copy-id`, and `sshpass`
+only for `-P`). `mem_alert.sh` and the remote half of `deploy_be.sh` are Linux-only
 (they read `/proc`).
 
 ## Scripts
@@ -212,6 +213,43 @@ Env overrides:
 | `ROLLBACK` | `1` | restore the backup when the new version fails to start |
 | `HEALTH_PORT` | `auto` | `auto` reads `be_http_port` from `conf/<role>.conf`; `0` skips the check |
 | `BACKUP_KEEP` | `5` | backups kept under `$REMOTE_BE/deploy_backup/` |
+
+### `ssh_copy_id.sh` — set up passwordless ssh to many hosts
+
+Runs `ssh-copy-id` against a list of hosts, taking the host list the same way
+as `deploy_be.sh` (`-H`, `-f`, or positional), so the same `hosts.txt` works
+for both.
+
+```bash
+# Typical use: install your key on every host in hosts.txt, as user sr
+./ssh_copy_id.sh -f hosts.txt -u sr
+
+# Same password everywhere: type it once (needs sshpass)
+./ssh_copy_id.sh -f hosts.txt -u sr -P
+
+# Only report which hosts are not passwordless yet
+./ssh_copy_id.sh -f hosts.txt -u sr -n
+
+# Use a specific key
+./ssh_copy_id.sh -u sr -i ~/.ssh/id_sr be01 be02
+```
+
+Per host: probe with `BatchMode=yes` and skip hosts that already accept the
+key (`-F` reinstalls anyway), run `ssh-copy-id`, then probe again to confirm.
+A failing host does not stop the rest; the summary lists every host that
+failed and the exit code is non-zero if any did.
+
+- Key: `-i <key>` (public key is `<key>.pub`); by default the first of
+  `~/.ssh/id_ed25519`, `~/.ssh/id_rsa`. If none exists, a passphrase-less
+  ed25519 key is generated at `~/.ssh/id_ed25519`.
+- `-P` reads the password once and feeds it to `sshpass` for every host; set
+  `SSHPASS` to skip the prompt. Without `-P`, `ssh-copy-id` asks per host.
+- Host keys: `SSH_OPTS` defaults to
+  `-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new`, so first
+  contact trusts the host key, but a changed key is still rejected.
+- A host entry may be `user@host`, which overrides `-u` for that host.
+- If the key installs but login still fails, the usual cause is remote `~` or
+  `~/.ssh` permissions being too open for `sshd`.
 
 ### `mem_alert.sh` — alert when available memory runs low
 
