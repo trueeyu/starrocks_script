@@ -7,7 +7,8 @@
 # 差别只在启停脚本、配置文件和 .out 日志的名字，用 -r be|cn 切换。
 #
 # 单台机器的部署流程（在远端执行）：
-#   1. scp bin/ lib/ 到远端临时目录（上传失败则不停服务）
+#   1. scp bin/ lib/ 到远端中转目录（上传失败则不停服务）
+#      默认放在部署目录的上级目录，和部署目录同一文件系统，mv 是瞬间改名
 #   2. ./bin/stop_<role>.sh，等待 starrocks_be 进程真正退出
 #   3. 把旧的 bin/lib 移动到备份目录
 #   4. 用新的 bin/lib 覆盖
@@ -24,6 +25,7 @@ set -uo pipefail
 ROLE="${ROLE:-be}"                  # 部署角色: be 或 cn（或用 -r 指定）
 LOCAL_BE="${LOCAL_BE:-./be}"        # 本地目录（需包含 bin/ 和 lib/）
 REMOTE_BE="${REMOTE_BE:-}"          # 远端部署目录，必填（或用 -d 指定）
+STAGE_DIR="${STAGE_DIR:-}"          # 远端中转目录的父目录，留空=部署目录的上级目录（或用 -t 指定）
 HOSTS="${HOSTS:-}"                  # 目标机器，逗号或空格分隔（或用 -H / -f / 位置参数）
 SSH_USER="${SSH_USER:-}"            # ssh 用户名，留空表示用当前用户/ssh config
 SSH_PORT="${SSH_PORT:-}"           # ssh 端口，留空表示默认
@@ -60,6 +62,8 @@ usage() {
   -r <role>   部署角色: be 或 cn                        (默认 be，或 ROLE)
   -s <dir>    本地目录，需包含 bin/ 和 lib/             (默认 ./be，或 LOCAL_BE)
   -d <dir>    远端部署目录（必填，或 REMOTE_BE）
+  -t <dir>    远端中转目录的父目录，上传内容先放在 <dir>/.<role>_deploy_<ts>/
+              (默认为部署目录的上级目录，或 STAGE_DIR；建议与部署目录同盘)
   -H <hosts>  目标机器，逗号/空格分隔（或 HOSTS，或位置参数）
   -f <file>   从文件读取机器列表，一行一个，# 开头为注释
   -u <user>   ssh 用户名                                (或 SSH_USER)
@@ -74,20 +78,22 @@ usage() {
           BACKUP_KEEP SSH_OPTS SCP_COMPRESS
 
 示例:
-  REMOTE_BE=/data/starrocks/be ./deploy_be.sh -s ~/starrocks/output/be be01 be02
-  ./deploy_be.sh -s ./be -d /data/starrocks/be -f hosts.txt -y
-  ./deploy_be.sh -r cn -s ~/starrocks/output/be -d /data/starrocks/cn cn01 cn02
-  HEALTH_PORT=0 ./deploy_be.sh -d /data/starrocks/be be01     # 跳过 http 健康检查
+  ./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -f hosts.txt -u sr
+  ./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -f hosts.txt -u sr -y -c
+  ./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -f hosts.txt -u sr -n   # 只看计划
+  ./deploy_be.sh -r cn -s ~/starrocks/output/be -d /home/disk1/sr/cn -f cn_hosts.txt -u sr
+  ./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -u sr be01 be02
 EOF
 }
 
 # ---- 参数解析 ----
 HOST_FILE=""
-while getopts ":r:s:d:H:f:u:p:ykcnh" opt; do
+while getopts ":r:s:d:t:H:f:u:p:ykcnh" opt; do
     case "$opt" in
         r) ROLE="$OPTARG" ;;
         s) LOCAL_BE="$OPTARG" ;;
         d) REMOTE_BE="$OPTARG" ;;
+        t) STAGE_DIR="$OPTARG" ;;
         H) HOSTS="$OPTARG" ;;
         f) HOST_FILE="$OPTARG" ;;
         u) SSH_USER="$OPTARG" ;;
@@ -129,6 +135,18 @@ case "$REMOTE_BE" in
     /*) ;;
     *) die "远端部署目录必须是绝对路径: $REMOTE_BE" ;;
 esac
+# 去掉末尾的 /，否则 dirname /a/b/ 之类的结果不符合预期
+while [ "${REMOTE_BE%/}" != "$REMOTE_BE" ] && [ "$REMOTE_BE" != / ]; do
+    REMOTE_BE="${REMOTE_BE%/}"
+done
+[ "$REMOTE_BE" != / ] || die "远端部署目录不能是 /"
+
+[ -n "$STAGE_DIR" ] || STAGE_DIR="$(dirname "$REMOTE_BE")"
+case "$STAGE_DIR" in
+    /*) ;;
+    *) die "中转目录必须是绝对路径: $STAGE_DIR" ;;
+esac
+STAGE_DIR="${STAGE_DIR%/}"
 
 case "$ROLE" in
     be|cn) ;;
@@ -145,7 +163,7 @@ esac
 [ -f "$LOCAL_BE/lib/starrocks_be" ] || die "本地缺少文件: $LOCAL_BE/lib/starrocks_be"
 
 TS="$(date '+%Y%m%d_%H%M%S')"
-STAGE="/tmp/${ROLE}_deploy_$TS"
+STAGE="$STAGE_DIR/.${ROLE}_deploy_$TS"
 
 SSH_TARGET_PREFIX=""
 [ -n "$SSH_USER" ] && SSH_TARGET_PREFIX="$SSH_USER@"
@@ -164,6 +182,7 @@ COPY_SIZE="$(du -shc "$LOCAL_BE/bin" "$LOCAL_BE/lib" 2>/dev/null | tail -1 | awk
 log "部署角色 : $(echo "$ROLE" | tr '[:lower:]' '[:upper:]')  (bin/start_$ROLE.sh, conf/$ROLE.conf, log/$ROLE.out)"
 log "本地目录 : $(cd "$LOCAL_BE" && pwd)  (bin+lib 共 $COPY_SIZE)"
 log "远端目录 : $REMOTE_BE"
+log "中转目录 : $STAGE  (部署结束后删除)"
 log "目标机器 : ${HOST_LIST[*]}"
 log "备份目录 : $REMOTE_BE/deploy_backup/$TS (保留最近 $BACKUP_KEEP 份)"
 log "参数     : STOP_TIMEOUT=${STOP_TIMEOUT}s START_TIMEOUT=${START_TIMEOUT}s" \
@@ -446,7 +465,7 @@ deploy_one() {
     local target="$SSH_TARGET_PREFIX$host"
 
     if ! $SSH_CMD "$target" "mkdir -p '$STAGE'"; then
-        log "$host: 无法连接或创建临时目录 $STAGE"
+        log "$host: 无法连接或创建中转目录 $STAGE"
         return 1
     fi
 

@@ -130,28 +130,33 @@ layout — only the start/stop scripts, the config file and the `.out` log are
 named differently — so `-r be|cn` (default `be`) switches roles.
 
 ```bash
-# Single node
-REMOTE_BE=/data/starrocks/be ./deploy_be.sh -s ~/starrocks/output/be be01
+# Typical use: roll the build out to every node listed in hosts.txt, as user sr
+./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -f hosts.txt -u sr
 
-# Several nodes, rolling (serial), skip the confirmation prompt
-./deploy_be.sh -s ./be -d /data/starrocks/be -y be01 be02 be03
-
-# CN nodes — same build output, different role
-./deploy_be.sh -r cn -s ~/starrocks/output/be -d /data/starrocks/cn cn01 cn02
-
-# Read the host list from a file, keep going if a node fails
-./deploy_be.sh -s ./be -d /data/starrocks/be -c -f hosts.txt
+# Same, but skip the confirmation prompt and keep going if a node fails
+./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -f hosts.txt -u sr -y -c
 
 # Print the plan without touching anything
-./deploy_be.sh -s ./be -d /data/starrocks/be -n be01
+./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -f hosts.txt -u sr -n
+
+# CN nodes — same build output, different role
+./deploy_be.sh -r cn -s ~/starrocks/output/be -d /home/disk1/sr/cn -f cn_hosts.txt -u sr
+
+# Hosts on the command line instead of a file
+./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -u sr be01 be02
 ```
 
 Per-node sequence (options must come **before** the host names; `<role>` is
 `be` or `cn`):
 
-1. `scp -r` the local `bin/` and `lib/` to `/tmp/<role>_deploy_<ts>/` on the
-   target (compressed in transit; `SCP_COMPRESS=0` disables) — the upload and
-   its sanity checks happen **before** the service is stopped.
+1. `scp -r` the local `bin/` and `lib/` to a staging dir
+   `<stage>/.<role>_deploy_<ts>/` on the target, where `<stage>` defaults to
+   the parent of `$REMOTE_BE` (override with `-t` / `STAGE_DIR`); compressed
+   in transit (`SCP_COMPRESS=0` disables). The upload and its sanity checks
+   happen **before** the service is stopped. Keeping the staging dir on the
+   same filesystem as `$REMOTE_BE` makes step 4 an instant rename rather than
+   a multi-GB copy while the service is down; it is removed when the node
+   finishes, success or not.
 2. `./bin/stop_<role>.sh`, then wait until no `starrocks_be` process belonging
    to this directory is left (matched by `/proc/<pid>/exe` and `cwd`, so a BE
    and a CN — or two instances — on the same host do not disturb each other).
@@ -179,6 +184,7 @@ Options:
 | `-r <role>` | `be` or `cn` (default `be`) |
 | `-s <dir>` | local dir containing `bin/` and `lib/` (default `./be`) |
 | `-d <dir>` | remote deploy dir, absolute path (required) |
+| `-t <dir>` | parent of the remote staging dir (default: parent of `-d`); keep it on the same disk as `-d` |
 | `-H <hosts>` | hosts, comma/space separated |
 | `-f <file>` | host list file, one per line, `#` comments allowed |
 | `-u <user>` / `-p <port>` | ssh user / port |
@@ -194,6 +200,7 @@ Env overrides:
 | `ROLE` | `be` | same as `-r` |
 | `LOCAL_BE` | `./be` | same as `-s` |
 | `REMOTE_BE` | _(unset)_ | same as `-d` |
+| `STAGE_DIR` | parent of `REMOTE_BE` | same as `-t` |
 | `HOSTS` | _(unset)_ | same as `-H` |
 | `SSH_USER` / `SSH_PORT` | _(unset)_ | same as `-u` / `-p` |
 | `SSH_OPTS` | `-o ConnectTimeout=10` | extra ssh/scp options |
