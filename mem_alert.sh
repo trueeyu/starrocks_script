@@ -48,9 +48,9 @@ while true; do
         eval "$CURL_CMD" >> "$CURL_LOG" 2>&1
         CURL_EXIT=$?
         if [ $CURL_EXIT -eq 0 ]; then
-            log "curl 执行成功，结果已写入 $CURL_LOG，脚本退出"
+            log "curl 执行成功，结果已写入 ${CURL_LOG}，脚本退出"
         else
-            log "curl 执行失败，退出码: $CURL_EXIT，详情见 $CURL_LOG"
+            log "curl 执行失败，退出码: ${CURL_EXIT}，详情见 $CURL_LOG"
         fi
         exit $CURL_EXIT
     fi

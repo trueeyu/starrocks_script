@@ -380,8 +380,8 @@ fail_after_backup() {
 
 # ---- 1. 前置检查（此时还没停服务）----
 [ -d "$SR_HOME" ] || die "远端目录不存在: $SR_HOME"
-[ -x "$SR_HOME/$STOP_SH" ] || die "缺少可执行文件: $SR_HOME/$STOP_SH（角色是不是选错了?）"
-[ -x "$SR_HOME/$START_SH" ] || die "缺少可执行文件: $SR_HOME/$START_SH（角色是不是选错了?）"
+[ -x "$SR_HOME/$STOP_SH" ] || die "缺少可执行文件: $SR_HOME/${STOP_SH}（角色是不是选错了?）"
+[ -x "$SR_HOME/$START_SH" ] || die "缺少可执行文件: $SR_HOME/${START_SH}（角色是不是选错了?）"
 [ -d "$SR_HOME/lib" ] || die "缺少目录: $SR_HOME/lib"
 
 [ -d "$NEW/bin" ] || die "上传的 bin 目录不存在: $NEW/bin"
