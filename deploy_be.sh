@@ -17,6 +17,10 @@
 #   7. 任一步失败（且 ROLLBACK=1）自动回滚到备份版本并重新拉起
 #
 # 多台机器串行滚动部署，默认某台失败即停止。
+#
+# 切换到历史版本：-l 列出每台机器上的备份，-R <时间戳|last> 切换到某份备份。
+# 切换时备份先在远端复制到中转目录（不上传），之后流程同上，当前版本也会
+# 存成一份新备份，因此可以再切回来。
 # ============================================================
 
 set -uo pipefail
@@ -43,6 +47,8 @@ BACKUP_KEEP="${BACKUP_KEEP:-5}"       # 远端保留的备份份数
 CONTINUE_ON_ERROR=0
 ASSUME_YES=0
 DRY_RUN=0
+LIST_BACKUPS=0
+RESTORE_TS=""
 
 # ---- 日志函数 ----
 log() {
@@ -72,6 +78,9 @@ usage() {
   -k          停止超时后 kill -9                        (等价 FORCE_KILL=1)
   -c          某台失败后继续部署其余机器
   -n          只打印计划，不实际执行
+  -l          列出每台机器上的备份（远端 <部署目录>/deploy_backup/），不做修改
+  -R <ts>     切换到某份备份，<ts> 为 -l 列出的时间戳，last 表示最近一份
+              (不需要 -s；当前版本会另存一份备份，可以再切回来)
   -h          显示帮助
 
 环境变量: STOP_TIMEOUT START_TIMEOUT STABLE_WAIT ROLLBACK HEALTH_PORT
@@ -83,12 +92,15 @@ usage() {
   ./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -f hosts.txt -u sr -n   # 只看计划
   ./deploy_be.sh -r cn -s ~/starrocks/output/be -d /home/disk1/sr/cn -f cn_hosts.txt -u sr
   ./deploy_be.sh -s ~/starrocks/output/be -d /home/disk1/sr/be -u sr be01 be02
+  ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -l                  # 列出备份
+  ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -R 20260927_082927  # 切到该备份
+  ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -R last             # 切到最近一份备份
 EOF
 }
 
 # ---- 参数解析 ----
 HOST_FILE=""
-while getopts ":r:s:d:t:H:f:u:p:ykcnh" opt; do
+while getopts ":r:s:d:t:H:f:u:p:ykcnlR:h" opt; do
     case "$opt" in
         r) ROLE="$OPTARG" ;;
         s) LOCAL_BE="$OPTARG" ;;
@@ -102,6 +114,8 @@ while getopts ":r:s:d:t:H:f:u:p:ykcnh" opt; do
         k) FORCE_KILL=1 ;;
         c) CONTINUE_ON_ERROR=1 ;;
         n) DRY_RUN=1 ;;
+        l) LIST_BACKUPS=1 ;;
+        R) RESTORE_TS="$OPTARG" ;;
         h) usage; exit 0 ;;
         \?) usage; die "未知选项: -$OPTARG" ;;
         :) usage; die "选项 -$OPTARG 需要参数" ;;
@@ -153,14 +167,23 @@ case "$ROLE" in
     *) die "角色只能是 be 或 cn: $ROLE" ;;
 esac
 
-# ---- 检查本地目录 ----
+if [ -n "$RESTORE_TS" ]; then
+    [ "$LIST_BACKUPS" = 1 ] && die "-l 和 -R 不能同时使用"
+    # 时间戳会拼进远端路径，只接受固定格式
+    echo "$RESTORE_TS" | grep -qE '^([0-9]{8}_[0-9]{6}|last)$' \
+        || die "-R 需要形如 20260927_082927 的时间戳或 last: $RESTORE_TS"
+fi
+
+# ---- 检查本地目录（切换/列出备份时用不到本地目录）----
 # BE 和 CN 共用 lib/starrocks_be，只有启停脚本名不同
-[ -d "$LOCAL_BE" ] || die "本地目录不存在: $LOCAL_BE"
-[ -d "$LOCAL_BE/bin" ] || die "本地缺少目录: $LOCAL_BE/bin"
-[ -d "$LOCAL_BE/lib" ] || die "本地缺少目录: $LOCAL_BE/lib"
-[ -f "$LOCAL_BE/bin/start_$ROLE.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/start_$ROLE.sh"
-[ -f "$LOCAL_BE/bin/stop_$ROLE.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/stop_$ROLE.sh"
-[ -f "$LOCAL_BE/lib/starrocks_be" ] || die "本地缺少文件: $LOCAL_BE/lib/starrocks_be"
+if [ -z "$RESTORE_TS" ] && [ "$LIST_BACKUPS" != 1 ]; then
+    [ -d "$LOCAL_BE" ] || die "本地目录不存在: $LOCAL_BE"
+    [ -d "$LOCAL_BE/bin" ] || die "本地缺少目录: $LOCAL_BE/bin"
+    [ -d "$LOCAL_BE/lib" ] || die "本地缺少目录: $LOCAL_BE/lib"
+    [ -f "$LOCAL_BE/bin/start_$ROLE.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/start_$ROLE.sh"
+    [ -f "$LOCAL_BE/bin/stop_$ROLE.sh" ] || die "本地缺少文件: $LOCAL_BE/bin/stop_$ROLE.sh"
+    [ -f "$LOCAL_BE/lib/starrocks_be" ] || die "本地缺少文件: $LOCAL_BE/lib/starrocks_be"
+fi
 
 TS="$(date '+%Y%m%d_%H%M%S')"
 STAGE="$STAGE_DIR/.${ROLE}_deploy_$TS"
@@ -176,11 +199,53 @@ if [ -n "$SSH_PORT" ]; then
 fi
 [ "$SCP_COMPRESS" = 1 ] && SCP_CMD="$SCP_CMD -C"
 
-COPY_SIZE="$(du -shc "$LOCAL_BE/bin" "$LOCAL_BE/lib" 2>/dev/null | tail -1 | awk '{print $1}')"
+# 远端 deploy_backup/ 下的备份（名字即时间戳），新的在前；用法: bash -s -- <部署目录>
+LIST_BACKUPS_SH='
+dir="$1/deploy_backup"
+names="$(ls -1 "$dir" 2>/dev/null | grep -E "^[0-9]{8}_[0-9]{6}\$" | sort -r)"
+if [ -z "$names" ]; then
+    echo "    (无备份)"
+    exit 0
+fi
+first=1
+for b in $names; do
+    t="$(echo "$b" | sed -E "s/^(....)(..)(..)_(..)(..)(..)\$/\1-\2-\3 \4:\5:\6/")"
+    size="$(du -sh "$dir/$b" 2>/dev/null | cut -f1)"
+    note=""
+    [ "$first" = 1 ] && note="  <- last"
+    { [ -d "$dir/$b/bin" ] && [ -d "$dir/$b/lib" ]; } || note="$note  (不完整，不能切换)"
+    printf "    %s  %s  %6s%s\n" "$b" "$t" "$size" "$note"
+    first=0
+done
+'
+
+if [ "$LIST_BACKUPS" = 1 ]; then
+    log "远端目录 : $REMOTE_BE/deploy_backup/"
+    log "时间戳是备份生成（即被替换下来）的时间，里面是那次部署之前的版本"
+    rc=0
+    for host in "${HOST_LIST[@]}"; do
+        echo "  $host:"
+        $SSH_CMD "$SSH_TARGET_PREFIX$host" bash -s -- "'$REMOTE_BE'" <<< "$LIST_BACKUPS_SH" \
+            || { echo "    (无法连接)"; rc=1; }
+    done
+    exit $rc
+fi
+
+if [ -z "$RESTORE_TS" ]; then
+    COPY_SIZE="$(du -shc "$LOCAL_BE/bin" "$LOCAL_BE/lib" 2>/dev/null | tail -1 | awk '{print $1}')"
+fi
 
 # ---- 部署计划 ----
 log "部署角色 : $(echo "$ROLE" | tr '[:lower:]' '[:upper:]')  (bin/start_$ROLE.sh, conf/$ROLE.conf, log/$ROLE.out)"
-log "本地目录 : $(cd "$LOCAL_BE" && pwd)  (bin+lib 共 $COPY_SIZE)"
+if [ -n "$RESTORE_TS" ]; then
+    if [ "$RESTORE_TS" = last ]; then
+        log "切换到   : 各机器 $REMOTE_BE/deploy_backup/ 下最近的一份备份  (先在远端复制到中转目录，不上传)"
+    else
+        log "切换到   : 远端备份 $REMOTE_BE/deploy_backup/$RESTORE_TS  (先在远端复制到中转目录，不上传)"
+    fi
+else
+    log "本地目录 : $(cd "$LOCAL_BE" && pwd)  (bin+lib 共 $COPY_SIZE)"
+fi
 log "远端目录 : $REMOTE_BE"
 log "中转目录 : $STAGE  (部署结束后删除)"
 log "目标机器 : ${HOST_LIST[*]}"
@@ -194,8 +259,9 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 if [ "$ASSUME_YES" != 1 ]; then
-    printf '将重启以上 %d 台机器的 %s，确认继续? [y/N] ' \
-        "${#HOST_LIST[@]}" "$(echo "$ROLE" | tr '[:lower:]' '[:upper:]')"
+    printf '将重启以上 %d 台机器的 %s%s，确认继续? [y/N] ' \
+        "${#HOST_LIST[@]}" "$(echo "$ROLE" | tr '[:lower:]' '[:upper:]')" \
+        "${RESTORE_TS:+ 并切换到备份 $RESTORE_TS}"
     read -r answer
     case "$answer" in
         y|Y|yes|YES) ;;
@@ -459,6 +525,21 @@ fi
 log "部署成功"
 REMOTE_EOF
 
+# 把某份备份的 bin/ lib/ 复制到中转目录，输出实际选中的时间戳；
+# 用法: bash -s -- <部署目录> <时间戳|last> <中转目录>
+COPY_BACKUP_SH='
+dir="$1/deploy_backup"; want="$2"; stage="$3"
+if [ "$want" = last ]; then
+    want="$(ls -1 "$dir" 2>/dev/null | grep -E "^[0-9]{8}_[0-9]{6}\$" | sort | tail -1)"
+fi
+if [ -z "$want" ] || [ ! -d "$dir/$want/bin" ] || [ ! -d "$dir/$want/lib" ]; then
+    echo "备份不存在或不完整: $dir/${want:-<无备份>}" >&2
+    exit 1
+fi
+cp -a "$dir/$want/bin" "$dir/$want/lib" "$stage/" || exit 1
+echo "$want"
+'
+
 # 在单台机器上跑完整流程，返回非 0 表示该机器失败
 deploy_one() {
     local host="$1"
@@ -469,13 +550,26 @@ deploy_one() {
         return 1
     fi
 
-    log "$host: scp bin/ lib/ -> $STAGE/ ($COPY_SIZE)"
-    if ! $SCP_CMD -r "$LOCAL_BE/bin" "$LOCAL_BE/lib" "$REMOTE_SH" "$target:$STAGE/"; then
-        log "$host: 上传失败"
-        $SSH_CMD "$target" "rm -rf '$STAGE'" >/dev/null 2>&1
-        return 1
+    if [ -n "$RESTORE_TS" ]; then
+        # 复制而不是移动：切换失败回滚时备份仍然完好
+        local picked
+        log "$host: 复制备份 $RESTORE_TS 的 bin/ lib/ -> $STAGE/"
+        if ! picked="$($SSH_CMD "$target" bash -s -- "'$REMOTE_BE'" "'$RESTORE_TS'" "'$STAGE'" <<< "$COPY_BACKUP_SH")" \
+            || ! $SCP_CMD "$REMOTE_SH" "$target:$STAGE/"; then
+            log "$host: 准备备份失败"
+            $SSH_CMD "$target" "rm -rf '$STAGE'" >/dev/null 2>&1
+            return 1
+        fi
+        log "$host: 已准备好备份 $picked"
+    else
+        log "$host: scp bin/ lib/ -> $STAGE/ ($COPY_SIZE)"
+        if ! $SCP_CMD -r "$LOCAL_BE/bin" "$LOCAL_BE/lib" "$REMOTE_SH" "$target:$STAGE/"; then
+            log "$host: 上传失败"
+            $SSH_CMD "$target" "rm -rf '$STAGE'" >/dev/null 2>&1
+            return 1
+        fi
+        log "$host: 上传完成"
     fi
-    log "$host: 上传完成"
 
     local rc=0
     $SSH_CMD "$target" \

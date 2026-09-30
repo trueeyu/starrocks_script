@@ -19,6 +19,11 @@
 # 多台机器按给出的顺序串行滚动部署，一台就绪后才动下一台，默认某台失败即停止。
 # 升级版本时 Leader 要放在最后（先 Observer，再 Follower，最后 Leader），
 # 否则新版 Leader 写出的元数据日志，旧版 Follower 可能无法回放。
+#
+# 切换到历史版本：-l 列出每台机器上的备份，-R <时间戳|last> 切换到某份备份。
+# 切换时备份先在远端复制到中转目录（不上传），之后流程同上，当前版本也会
+# 存成一份新备份，因此可以再切回来。meta/ 不在备份里：新版本改写过的元数据，
+# 旧版本不一定能读。
 # ============================================================
 
 set -uo pipefail
@@ -45,6 +50,8 @@ REMOTE_JAVA_HOME="${REMOTE_JAVA_HOME:-}" # 远端 JAVA_HOME，留空=沿用正�
 CONTINUE_ON_ERROR=0
 ASSUME_YES=0
 DRY_RUN=0
+LIST_BACKUPS=0
+RESTORE_TS=""
 
 # 必须部署的目录 + 本地存在才部署的目录
 REQUIRED_DIRS="bin lib"
@@ -77,6 +84,9 @@ usage() {
   -k          停止超时后 kill -9                        (等价 FORCE_KILL=1)
   -c          某台失败后继续部署其余机器
   -n          只打印计划，不实际执行
+  -l          列出每台机器上的备份（远端 <部署目录>/deploy_backup/），不做修改
+  -R <ts>     切换到某份备份，<ts> 为 -l 列出的时间戳，last 表示最近一份
+              (不需要 -s；当前版本会另存一份备份，可以再切回来；meta/ 不会回退)
   -h          显示帮助
 
 按给出的顺序逐台部署。升级版本时把 Leader 放在最后。
@@ -88,12 +98,15 @@ usage() {
   ./deploy_fe.sh -s ~/starrocks/output/fe -d /home/disk1/sr/fe -f fe_hosts.txt -u sr
   ./deploy_fe.sh -s ~/starrocks/output/fe -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -n   # 只看计划
   ./deploy_fe.sh -s ~/starrocks/output/fe -d /home/disk1/sr/fe -u sr fe02 fe03 fe01      # fe01 是 Leader
+  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -l                  # 列出备份
+  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R 20260927_082927  # 切到该备份
+  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R last             # 切到最近一份备份
 EOF
 }
 
 # ---- 参数解析 ----
 HOST_FILE=""
-while getopts ":s:d:t:H:f:u:p:ykcnh" opt; do
+while getopts ":s:d:t:H:f:u:p:ykcnlR:h" opt; do
     case "$opt" in
         s) LOCAL_FE="$OPTARG" ;;
         d) REMOTE_FE="$OPTARG" ;;
@@ -106,6 +119,8 @@ while getopts ":s:d:t:H:f:u:p:ykcnh" opt; do
         k) FORCE_KILL=1 ;;
         c) CONTINUE_ON_ERROR=1 ;;
         n) DRY_RUN=1 ;;
+        l) LIST_BACKUPS=1 ;;
+        R) RESTORE_TS="$OPTARG" ;;
         h) usage; exit 0 ;;
         \?) usage; die "未知选项: -$OPTARG" ;;
         :) usage; die "选项 -$OPTARG 需要参数" ;;
@@ -152,19 +167,31 @@ case "$STAGE_DIR" in
 esac
 STAGE_DIR="${STAGE_DIR%/}"
 
-# ---- 检查本地目录 ----
-[ -d "$LOCAL_FE" ] || die "本地目录不存在: $LOCAL_FE"
-for d in $REQUIRED_DIRS; do
-    [ -d "$LOCAL_FE/$d" ] || die "本地缺少目录: $LOCAL_FE/$d"
-done
-[ -f "$LOCAL_FE/bin/start_fe.sh" ] || die "本地缺少文件: $LOCAL_FE/bin/start_fe.sh"
-[ -f "$LOCAL_FE/bin/stop_fe.sh" ] || die "本地缺少文件: $LOCAL_FE/bin/stop_fe.sh"
-[ -f "$LOCAL_FE/lib/starrocks-fe.jar" ] || die "本地缺少文件: $LOCAL_FE/lib/starrocks-fe.jar"
+if [ -n "$RESTORE_TS" ]; then
+    [ "$LIST_BACKUPS" = 1 ] && die "-l 和 -R 不能同时使用"
+    # 时间戳会拼进远端路径，只接受固定格式
+    echo "$RESTORE_TS" | grep -qE '^([0-9]{8}_[0-9]{6}|last)$' \
+        || die "-R 需要形如 20260927_082927 的时间戳或 last: $RESTORE_TS"
+fi
 
-DEPLOY_DIRS="$REQUIRED_DIRS"
-for d in $OPTIONAL_DIRS; do
-    [ -d "$LOCAL_FE/$d" ] && DEPLOY_DIRS="$DEPLOY_DIRS $d"
-done
+if [ -n "$RESTORE_TS" ] || [ "$LIST_BACKUPS" = 1 ]; then
+    # 切换时处理全部目录：备份里没有的可选目录，说明旧版本没有它，会被移走
+    DEPLOY_DIRS="$REQUIRED_DIRS $OPTIONAL_DIRS"
+else
+    # ---- 检查本地目录 ----
+    [ -d "$LOCAL_FE" ] || die "本地目录不存在: $LOCAL_FE"
+    for d in $REQUIRED_DIRS; do
+        [ -d "$LOCAL_FE/$d" ] || die "本地缺少目录: $LOCAL_FE/$d"
+    done
+    [ -f "$LOCAL_FE/bin/start_fe.sh" ] || die "本地缺少文件: $LOCAL_FE/bin/start_fe.sh"
+    [ -f "$LOCAL_FE/bin/stop_fe.sh" ] || die "本地缺少文件: $LOCAL_FE/bin/stop_fe.sh"
+    [ -f "$LOCAL_FE/lib/starrocks-fe.jar" ] || die "本地缺少文件: $LOCAL_FE/lib/starrocks-fe.jar"
+
+    DEPLOY_DIRS="$REQUIRED_DIRS"
+    for d in $OPTIONAL_DIRS; do
+        [ -d "$LOCAL_FE/$d" ] && DEPLOY_DIRS="$DEPLOY_DIRS $d"
+    done
+fi
 
 TS="$(date '+%Y%m%d_%H%M%S')"
 STAGE="$STAGE_DIR/.fe_deploy_$TS"
@@ -180,14 +207,54 @@ if [ -n "$SSH_PORT" ]; then
 fi
 [ "$SCP_COMPRESS" = 1 ] && SCP_CMD="$SCP_CMD -C"
 
-LOCAL_PATHS=()
-for d in $DEPLOY_DIRS; do
-    LOCAL_PATHS+=("$LOCAL_FE/$d")
+# 远端 deploy_backup/ 下的备份（名字即时间戳），新的在前；用法: bash -s -- <部署目录>
+LIST_BACKUPS_SH='
+dir="$1/deploy_backup"
+names="$(ls -1 "$dir" 2>/dev/null | grep -E "^[0-9]{8}_[0-9]{6}\$" | sort -r)"
+if [ -z "$names" ]; then
+    echo "    (无备份)"
+    exit 0
+fi
+first=1
+for b in $names; do
+    t="$(echo "$b" | sed -E "s/^(....)(..)(..)_(..)(..)(..)\$/\1-\2-\3 \4:\5:\6/")"
+    size="$(du -sh "$dir/$b" 2>/dev/null | cut -f1)"
+    note=""
+    [ "$first" = 1 ] && note="  <- last"
+    { [ -d "$dir/$b/bin" ] && [ -d "$dir/$b/lib" ]; } || note="$note  (不完整，不能切换)"
+    printf "    %s  %s  %6s%s\n" "$b" "$t" "$size" "$note"
+    first=0
 done
-COPY_SIZE="$(du -shc "${LOCAL_PATHS[@]}" 2>/dev/null | tail -1 | awk '{print $1}')"
+'
+
+if [ "$LIST_BACKUPS" = 1 ]; then
+    log "远端目录 : $REMOTE_FE/deploy_backup/"
+    log "时间戳是备份生成（即被替换下来）的时间，里面是那次部署之前的版本"
+    rc=0
+    for host in "${HOST_LIST[@]}"; do
+        echo "  $host:"
+        $SSH_CMD "$SSH_TARGET_PREFIX$host" bash -s -- "'$REMOTE_FE'" <<< "$LIST_BACKUPS_SH" \
+            || { echo "    (无法连接)"; rc=1; }
+    done
+    exit $rc
+fi
+
+LOCAL_PATHS=()
+if [ -z "$RESTORE_TS" ]; then
+    for d in $DEPLOY_DIRS; do
+        LOCAL_PATHS+=("$LOCAL_FE/$d")
+    done
+    COPY_SIZE="$(du -shc "${LOCAL_PATHS[@]}" 2>/dev/null | tail -1 | awk '{print $1}')"
+fi
 
 # ---- 部署计划 ----
-log "本地目录 : $(cd "$LOCAL_FE" && pwd)  ($DEPLOY_DIRS 共 $COPY_SIZE)"
+if [ "$RESTORE_TS" = last ]; then
+    log "切换到   : 各机器 $REMOTE_FE/deploy_backup/ 下最近的一份备份  (先在远端复制到中转目录，不上传)"
+elif [ -n "$RESTORE_TS" ]; then
+    log "切换到   : 远端备份 $REMOTE_FE/deploy_backup/$RESTORE_TS  (先在远端复制到中转目录，不上传)"
+else
+    log "本地目录 : $(cd "$LOCAL_FE" && pwd)  ($DEPLOY_DIRS 共 $COPY_SIZE)"
+fi
 log "远端目录 : $REMOTE_FE"
 log "中转目录 : $STAGE  (部署结束后删除)"
 log "目标机器 : ${HOST_LIST[*]}  (按此顺序，Leader 应在最后)"
@@ -201,8 +268,8 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 if [ "$ASSUME_YES" != 1 ]; then
-    printf '将按顺序重启以上 %d 台机器的 FE（Leader 应在最后），确认继续? [y/N] ' \
-        "${#HOST_LIST[@]}"
+    printf '将按顺序重启以上 %d 台机器的 FE%s（Leader 应在最后），确认继续? [y/N] ' \
+        "${#HOST_LIST[@]}" "${RESTORE_TS:+ 并切换到备份 $RESTORE_TS}"
     read -r answer
     case "$answer" in
         y|Y|yes|YES) ;;
@@ -422,7 +489,7 @@ fail_after_backup() {
 [ -f "$SR_HOME/$CONF_FILE" ] || die "缺少配置文件: $SR_HOME/${CONF_FILE}（目录是不是选错了?）"
 [ -d "$SR_HOME/lib" ] || die "缺少目录: $SR_HOME/lib"
 
-for d in $DEPLOY_DIRS; do
+for d in bin lib; do
     [ -d "$NEW/$d" ] || die "上传的 $d 目录不存在: $NEW/$d"
 done
 [ -f "$NEW/$START_SH" ] || die "上传内容缺少 $START_SH"
@@ -492,6 +559,11 @@ log "已备份旧的${MOVED} 到 $BACKUP_DIR"
 
 # ---- 4. 覆盖为新版本 ----
 for d in $DEPLOY_DIRS; do
+    if [ ! -d "$NEW/$d" ]; then
+        # 只有切换到备份时会发生：要切换到的版本没有这个目录
+        [ -e "$BACKUP_DIR/$d" ] && log "新版本没有 $d/，当前的已随旧版本移入备份"
+        continue
+    fi
     if ! mv "$NEW/$d" "$SR_HOME/$d"; then
         fail_after_backup "写入新 $d 失败"
     fi
@@ -522,6 +594,24 @@ fi
 log "部署成功"
 REMOTE_EOF
 
+# 把某份备份里的目录复制到中转目录，输出实际选中的时间戳；
+# 用法: bash -s -- <部署目录> <时间戳|last> <中转目录> "<目录列表>"
+COPY_BACKUP_SH='
+dir="$1/deploy_backup"; want="$2"; stage="$3"; dirs="$4"
+if [ "$want" = last ]; then
+    want="$(ls -1 "$dir" 2>/dev/null | grep -E "^[0-9]{8}_[0-9]{6}\$" | sort | tail -1)"
+fi
+if [ -z "$want" ] || [ ! -d "$dir/$want/bin" ] || [ ! -d "$dir/$want/lib" ]; then
+    echo "备份不存在或不完整: $dir/${want:-<无备份>}" >&2
+    exit 1
+fi
+for d in $dirs; do
+    [ -d "$dir/$want/$d" ] || continue
+    cp -a "$dir/$want/$d" "$stage/" || exit 1
+done
+echo "$want"
+'
+
 # 在单台机器上跑完整流程，返回非 0 表示该机器失败
 deploy_one() {
     local host="$1"
@@ -532,13 +622,26 @@ deploy_one() {
         return 1
     fi
 
-    log "$host: scp $DEPLOY_DIRS -> $STAGE/ ($COPY_SIZE)"
-    if ! $SCP_CMD -r "${LOCAL_PATHS[@]}" "$REMOTE_SH" "$target:$STAGE/"; then
-        log "$host: 上传失败"
-        $SSH_CMD "$target" "rm -rf '$STAGE'" >/dev/null 2>&1
-        return 1
+    if [ -n "$RESTORE_TS" ]; then
+        # 复制而不是移动：切换失败回滚时备份仍然完好
+        local picked
+        log "$host: 复制备份 $RESTORE_TS -> $STAGE/"
+        if ! picked="$($SSH_CMD "$target" bash -s -- "'$REMOTE_FE'" "'$RESTORE_TS'" "'$STAGE'" "'$DEPLOY_DIRS'" <<< "$COPY_BACKUP_SH")" \
+            || ! $SCP_CMD "$REMOTE_SH" "$target:$STAGE/"; then
+            log "$host: 准备备份失败"
+            $SSH_CMD "$target" "rm -rf '$STAGE'" >/dev/null 2>&1
+            return 1
+        fi
+        log "$host: 已准备好备份 $picked"
+    else
+        log "$host: scp $DEPLOY_DIRS -> $STAGE/ ($COPY_SIZE)"
+        if ! $SCP_CMD -r "${LOCAL_PATHS[@]}" "$REMOTE_SH" "$target:$STAGE/"; then
+            log "$host: 上传失败"
+            $SSH_CMD "$target" "rm -rf '$STAGE'" >/dev/null 2>&1
+            return 1
+        fi
+        log "$host: 上传完成"
     fi
-    log "$host: 上传完成"
 
     local rc=0
     $SSH_CMD "$target" \

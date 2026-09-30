@@ -178,6 +178,31 @@ If the role does not match the target directory, the missing
 `bin/start_<role>.sh` is caught by the pre-flight check — before anything is
 stopped or moved.
 
+#### Switching to an earlier version
+
+Every deploy leaves the replaced `bin/` + `lib/` in
+`$REMOTE_BE/deploy_backup/<ts>/` (newest `BACKUP_KEEP` kept), and those can be
+switched back to — no `-s` or upload needed:
+
+```bash
+# List the backups on each host, newest first
+./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -l
+
+# Switch to a specific backup, or to the newest one
+./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -R 20260927_082927
+./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -R last
+```
+
+`<ts>` is when the backup was taken, i.e. when that version was *replaced*;
+all hosts of one run share the same `<ts>`. `-l` prints the timestamp, the
+time and the size, and flags incomplete backups.
+
+`-R` copies the backup into the staging dir on the host (`cp -a`, so it needs
+that much free disk; the backup itself is left intact) and then runs the
+normal sequence from step 2 on: stop, back up the **current** version as a new
+`<ts>`, swap, start, verify, roll back on failure. Because the current version
+is saved too, `-R last` right after a switch switches straight back.
+
 Options:
 
 | Option | Purpose |
@@ -193,6 +218,8 @@ Options:
 | `-k` | `kill -9` if the process does not exit before `STOP_TIMEOUT` |
 | `-c` | continue with the remaining hosts after a failure |
 | `-n` | dry run: print the plan only |
+| `-l` | list the backups on each host |
+| `-R <ts>` | switch to backup `<ts>` (from `-l`), or `last` for the newest |
 
 Env overrides:
 
@@ -228,6 +255,10 @@ backup and rollback — adapted to the FE.
 
 # Hosts on the command line, Leader (fe01) last
 ./deploy_fe.sh -s ~/starrocks/output/fe -d /home/disk1/sr/fe -u sr fe02 fe03 fe01
+
+# List backups / switch to the newest one (see "Switching to an earlier version")
+./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -l
+./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R last
 ```
 
 **Order matters.** Hosts are deployed strictly in the order given, and the
@@ -263,6 +294,13 @@ Differences from `deploy_be.sh`:
 - Only `bin/`/`lib/` etc. are backed up, not `meta/`. If a new version has
   already rewritten the image, rolling back to an older version may not be
   able to read it — back up `meta/` yourself before a version upgrade.
+- `-l` / `-R <ts|last>` switch to an earlier version exactly as in
+  `deploy_be.sh` — and the `meta/` caveat above applies to them in full.
+  Switching across versions is a downgrade: check the StarRocks downgrade
+  notes for the version pair and order the hosts as they say.
+  An optional directory (`webroot/`, `spark-dpp/`, `hive-udf/`) missing from
+  the backup is moved out with the current version, so the result matches the
+  backup exactly.
 
 Env overrides are the same as `deploy_be.sh` (`LOCAL_FE` / `REMOTE_FE` in
 place of `LOCAL_BE` / `REMOTE_BE`, no `ROLE`), plus `REMOTE_JAVA_HOME`.
