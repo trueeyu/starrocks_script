@@ -112,7 +112,8 @@ usage() {
   ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -l                  # 列出备份
   ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R 20260927_082927  # 切到该备份
   ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R last             # 切到最近一份备份
-  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -S JAVA_OPTS,sys_log_level  # 查看配置
+  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -S all                     # 列出 fe.conf 全部配置
+  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -S JAVA_OPTS,sys_log_level  # 查看指定配置
   ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -C sys_log_level=WARN -n    # 预览配置 diff
   ./deploy_fe.sh -d /home/disk1/sr/fe -u sr -C sys_log_level=WARN fe02 fe03 fe01
 EOF

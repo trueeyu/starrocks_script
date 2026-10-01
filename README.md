@@ -206,7 +206,10 @@ is saved too, `-R last` right after a switch switches straight back.
 #### Viewing and changing the config
 
 ```bash
-# Show keys from conf/<role>.conf on each host (or -S all for every set key)
+# List every key set in conf/<role>.conf on each host
+./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -S all
+
+# Show specific keys
 ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -S mem_limit,sys_log_level
 
 # Preview the per-host diff, then apply and restart
@@ -296,6 +299,7 @@ backup and rollback — adapted to the FE.
 ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R last
 
 # Show / change config and restart (see "Viewing and changing the config")
+./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -S all
 ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -S sys_log_level
 ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -C sys_log_level=WARN
 ```

@@ -106,7 +106,8 @@ usage() {
   ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -l                  # 列出备份
   ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -R 20260927_082927  # 切到该备份
   ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -R last             # 切到最近一份备份
-  ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -S mem_limit,sys_log_level  # 查看配置
+  ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -S all                     # 列出 be.conf 全部配置
+  ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -S mem_limit,sys_log_level  # 查看指定配置
   ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -C mem_limit=80% -n    # 预览配置 diff
   ./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -C mem_limit=80% -U sys_log_level
 EOF
