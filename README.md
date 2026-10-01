@@ -368,6 +368,9 @@ for both.
 
 # Use a specific key
 ./ssh_copy_id.sh -u sr -i ~/.ssh/id_sr be01 be02
+
+# Do not auto-fix hosts whose host key changed, only report them
+./ssh_copy_id.sh -f hosts.txt -u sr -s
 ```
 
 Per host: probe with `BatchMode=yes` and skip hosts that already accept the
@@ -382,7 +385,16 @@ failed and the exit code is non-zero if any did.
   `SSHPASS` to skip the prompt. Without `-P`, `ssh-copy-id` asks per host.
 - Host keys: `SSH_OPTS` defaults to
   `-o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new`, so first
-  contact trusts the host key, but a changed key is still rejected.
+  contact trusts the host key.
+- Changed host key (`REMOTE HOST IDENTIFICATION HAS CHANGED`, typically a
+  reinstalled machine or a reused IP): by default the stale entry is removed
+  with `ssh-keygen -R` (from the `known_hosts` file and host/port that
+  `ssh -G` resolves, so ssh config aliases work), the new fingerprint is
+  printed for the record, the old file is kept as `known_hosts.old`, and the
+  host is then handled as usual. Only the affected host's entry is touched.
+  This trades away ssh's man-in-the-middle check for those hosts — pass `-s`
+  to only report them instead (with the exact `ssh-keygen -R` command), e.g.
+  on networks you do not control. `-n` reports them without changing anything.
 - A host entry may be `user@host`, which overrides `-u` for that host.
 - If the key installs but login still fails, the usual cause is remote `~` or
   `~/.ssh` permissions being too open for `sshd`.

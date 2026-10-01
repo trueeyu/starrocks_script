@@ -12,6 +12,8 @@
 #   3. 再用 BatchMode 试连，确认免密生效
 #
 # 本地没有密钥时自动生成一把无口令的 ed25519 密钥。
+# 主机指纹变了（重装系统、IP 换了机器）时默认删掉 known_hosts 里的旧记录、
+# 信任新指纹，并打印新指纹留档；加 -s 则只报错不删除。
 # 用 -P 时只输入一次密码，借助 sshpass 用于所有机器。
 # 某台失败不影响其余机器，最后汇总，有失败则返回非 0。
 # ============================================================
@@ -29,6 +31,7 @@ SSH_OPTS="${SSH_OPTS:--o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new}"
 ASK_PASS=0
 FORCE=0
 DRY_RUN=0
+RESET_HOSTKEY="${RESET_HOSTKEY:-1}"  # 主机指纹变了时是否删除旧记录（-s 关闭）
 
 # ---- 日志函数 ----
 log() {
@@ -52,6 +55,8 @@ usage() {
   -i <key>    私钥路径，公钥为 <key>.pub                (或 SSH_KEY)
   -P          只输入一次密码，用于所有机器（需要 sshpass；也可设 SSHPASS）
   -F          已经免密的机器也重新安装公钥
+  -s          主机指纹变了时只报错，不删除 known_hosts 里的旧记录
+              (默认会删除并信任新指纹，适合机器重装、IP 复用频繁的内网环境)
   -n          只检查哪些机器已经免密，不做修改
   -h          显示帮助
 
@@ -61,13 +66,14 @@ usage() {
   ./ssh_copy_id.sh -f hosts.txt -u sr
   ./ssh_copy_id.sh -f hosts.txt -u sr -P        # 所有机器密码相同，只输一次
   ./ssh_copy_id.sh -f hosts.txt -u sr -n        # 只看哪些还没配好
+  ./ssh_copy_id.sh -f hosts.txt -u sr -s        # 指纹变了的机器只报错，不自动处理
   ./ssh_copy_id.sh -u sr -i ~/.ssh/id_sr be01 be02
 EOF
 }
 
 # ---- 参数解析 ----
 HOST_FILE=""
-while getopts ":H:f:u:p:i:PFnh" opt; do
+while getopts ":H:f:u:p:i:PFsnh" opt; do
     case "$opt" in
         H) HOSTS="$OPTARG" ;;
         f) HOST_FILE="$OPTARG" ;;
@@ -76,6 +82,7 @@ while getopts ":H:f:u:p:i:PFnh" opt; do
         i) SSH_KEY="$OPTARG" ;;
         P) ASK_PASS=1 ;;
         F) FORCE=1 ;;
+        s) RESET_HOSTKEY=0 ;;
         n) DRY_RUN=1 ;;
         h) usage; exit 0 ;;
         \?) usage; die "未知选项: -$OPTARG" ;;
@@ -156,9 +163,59 @@ log "公钥     : $SSH_KEY.pub"
 log "目标机器 : ${HOST_LIST[*]}"
 [ -n "$SSH_USER" ] && log "ssh 用户 : $SSH_USER"
 
-# 免密是否已生效：只用这把钥匙、不允许输密码
+# 免密是否已生效：只用这把钥匙、不允许输密码。ssh 的报错留在 PROBE_ERR 里
+PROBE_ERR=""
 can_login() {
-    $SSH_CMD -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_KEY" "$1" true </dev/null >/dev/null 2>&1
+    PROBE_ERR="$($SSH_CMD -o BatchMode=yes -o IdentitiesOnly=yes -i "$SSH_KEY" "$1" true </dev/null 2>&1 >/dev/null)"
+}
+
+host_key_changed() {
+    echo "$PROBE_ERR" | grep -q 'REMOTE HOST IDENTIFICATION HAS CHANGED'
+}
+
+# 主机指纹变了：默认删掉旧记录，返回 0 表示可以继续；-s 或 dry-run 时只提示。
+# 用 ssh -G 解析出真实的主机名、端口和 known_hosts 文件，ssh config 里的别名也能处理。
+handle_changed_key() {
+    local host="$1" target="$2" cfg name port file entry fp
+    cfg="$($SSH_CMD -G "$target" 2>/dev/null)"
+    name="$(echo "$cfg" | awk '$1 == "hostname" {print $2; exit}')"
+    port="$(echo "$cfg" | awk '$1 == "port" {print $2; exit}')"
+    file="$(echo "$cfg" | awk '$1 == "userknownhostsfile" {print $2; exit}')"
+    [ -n "$name" ] || name="${host#*@}"
+    file="${file:-$HOME/.ssh/known_hosts}"
+    file="${file/#\~/$HOME}"
+    entry="$name"
+    [ -n "$port" ] && [ "$port" != 22 ] && entry="[$name]:$port"
+
+    if [ "$DRY_RUN" = 1 ]; then
+        if [ "$RESET_HOSTKEY" = 1 ]; then
+            log "$host: 主机指纹已变化，执行时会删除 $file 中 $entry 的旧记录"
+        else
+            log "$host: 主机指纹已变化（-s 下不会自动删除旧记录）"
+        fi
+        return 1
+    fi
+    if [ "$RESET_HOSTKEY" != 1 ]; then
+        log "$host: 主机指纹已变化，ssh 拒绝连接（known_hosts 里的旧记录与机器当前的不一致）"
+        log "$host:   确认机器重装过或 IP 换了机器后，去掉 -s 重试，或手动执行:"
+        log "$host:   ssh-keygen -f \"$file\" -R \"$entry\""
+        return 1
+    fi
+
+    # 记下新指纹，事后可以和机器上 ssh-keygen -lf /etc/ssh/ssh_host_*_key.pub 核对
+    fp="$(ssh-keyscan -T 5 -p "${port:-22}" "$name" 2>/dev/null | ssh-keygen -lf - 2>/dev/null)"
+    log "$host: 主机指纹已变化，删除 $file 中 $entry 的旧记录"
+    if [ -n "$fp" ]; then
+        echo "$fp" | sed "s/^/    新指纹: /"
+    else
+        log "$host:   (ssh-keyscan 未取到新指纹)"
+    fi
+    if ! ssh-keygen -f "$file" -R "$entry" >/dev/null 2>&1; then
+        log "$host: 删除旧记录失败"
+        return 1
+    fi
+    log "$host: 已删除旧记录（原文件备份为 $file.old），下次连接将信任新指纹"
+    return 0
 }
 
 # ---- 逐台处理 ----
@@ -173,10 +230,23 @@ for host in "${HOST_LIST[@]}"; do
         *) target="$SSH_TARGET_PREFIX$host" ;;
     esac
 
-    if [ "$FORCE" != 1 ] && can_login "$target"; then
-        log "$host: 已免密，跳过"
-        SKIP_HOSTS="$SKIP_HOSTS $host"
-        continue
+    if can_login "$target"; then
+        if [ "$FORCE" != 1 ]; then
+            log "$host: 已免密，跳过"
+            SKIP_HOSTS="$SKIP_HOSTS $host"
+            continue
+        fi
+    elif host_key_changed; then
+        if ! handle_changed_key "$host" "$target"; then
+            FAIL_HOSTS="$FAIL_HOSTS $host"
+            continue
+        fi
+        # 换了指纹后可能本来就是免密的（重装时保留了 authorized_keys 等）
+        if [ "$FORCE" != 1 ] && can_login "$target"; then
+            log "$host: 已免密，跳过"
+            SKIP_HOSTS="$SKIP_HOSTS $host"
+            continue
+        fi
     fi
 
     if [ "$DRY_RUN" = 1 ]; then
