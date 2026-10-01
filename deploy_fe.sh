@@ -24,6 +24,10 @@
 # 切换时备份先在远端复制到中转目录（不上传），之后流程同上，当前版本也会
 # 存成一份新备份，因此可以再切回来。meta/ 不在备份里：新版本改写过的元数据，
 # 旧版本不一定能读。
+#
+# 修改配置并重启：-C key=value / -U key（可重复），-S 查看配置。各机器上先算出
+# 新的 conf/fe.conf 并打印 diff，无变化的机器跳过；有变化则停服、备份为
+# conf/fe.conf.bak.<ts>、写入、启动、检查，失败自动恢复原配置。
 # ============================================================
 
 set -uo pipefail
@@ -52,6 +56,8 @@ ASSUME_YES=0
 DRY_RUN=0
 LIST_BACKUPS=0
 RESTORE_TS=""
+CONF_EDITS=""          # 每行一条: set<TAB>key<TAB>value 或 unset<TAB>key
+SHOW_KEYS=""           # -S: 逗号分隔的配置项，或 all
 
 # 必须部署的目录 + 本地存在才部署的目录
 REQUIRED_DIRS="bin lib"
@@ -87,6 +93,11 @@ usage() {
   -l          列出每台机器上的备份（远端 <部署目录>/deploy_backup/），不做修改
   -R <ts>     切换到某份备份，<ts> 为 -l 列出的时间戳，last 表示最近一份
               (不需要 -s；当前版本会另存一份备份，可以再切回来；meta/ 不会回退)
+  -C <k=v>    修改 conf/fe.conf 中的配置项并重启，可重复（不需要 -s）
+  -U <key>    注释掉 conf/fe.conf 中的配置项（恢复默认值）并重启，可重复
+              (-C/-U 加 -n 时只打印各机器上的配置 diff，不做修改)
+  -S <keys>   查看各机器 conf/fe.conf 中的配置项，逗号分隔；all 表示全部生效行
+              (只读配置文件；运行中的值可能已被 ADMIN SET FRONTEND CONFIG 临时改过)
   -h          显示帮助
 
 按给出的顺序逐台部署。升级版本时把 Leader 放在最后。
@@ -101,12 +112,40 @@ usage() {
   ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -l                  # 列出备份
   ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R 20260927_082927  # 切到该备份
   ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R last             # 切到最近一份备份
+  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -S JAVA_OPTS,sys_log_level  # 查看配置
+  ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -C sys_log_level=WARN -n    # 预览配置 diff
+  ./deploy_fe.sh -d /home/disk1/sr/fe -u sr -C sys_log_level=WARN fe02 fe03 fe01
 EOF
+}
+
+# -C / -U 的参数校验后追加到 CONF_EDITS
+add_conf_edit() {
+    local op="$1" arg="$2" key value=""
+    if [ "$op" = set ]; then
+        case "$arg" in
+            *=*) ;;
+            *) die "-C 需要 key=value 形式: $arg" ;;
+        esac
+        key="${arg%%=*}"
+        value="${arg#*=}"
+        # 允许 key = value 这种带空格的写法
+        key="$(echo "$key" | tr -d '[:space:]')"
+        value="$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    else
+        key="$arg"
+    fi
+    echo "$key" | grep -qE '^[A-Za-z_][A-Za-z0-9_.]*$' || die "配置项名不合法: $key"
+    case "$value" in
+        *$'\t'*|*$'\n'*) die "配置值不能包含制表符或换行: $key" ;;
+    esac
+    CONF_EDITS="$CONF_EDITS$op"$'\t'"$key"
+    [ "$op" = set ] && CONF_EDITS="$CONF_EDITS"$'\t'"$value"
+    CONF_EDITS="$CONF_EDITS"$'\n'
 }
 
 # ---- 参数解析 ----
 HOST_FILE=""
-while getopts ":s:d:t:H:f:u:p:ykcnlR:h" opt; do
+while getopts ":s:d:t:H:f:u:p:ykcnlR:C:U:S:h" opt; do
     case "$opt" in
         s) LOCAL_FE="$OPTARG" ;;
         d) REMOTE_FE="$OPTARG" ;;
@@ -121,6 +160,9 @@ while getopts ":s:d:t:H:f:u:p:ykcnlR:h" opt; do
         n) DRY_RUN=1 ;;
         l) LIST_BACKUPS=1 ;;
         R) RESTORE_TS="$OPTARG" ;;
+        C) add_conf_edit set "$OPTARG" ;;
+        U) add_conf_edit unset "$OPTARG" ;;
+        S) SHOW_KEYS="$OPTARG" ;;
         h) usage; exit 0 ;;
         \?) usage; die "未知选项: -$OPTARG" ;;
         :) usage; die "选项 -$OPTARG 需要参数" ;;
@@ -167,6 +209,21 @@ case "$STAGE_DIR" in
 esac
 STAGE_DIR="${STAGE_DIR%/}"
 
+MODE=deploy
+[ -n "$CONF_EDITS" ] && MODE=config
+if [ "$MODE" = config ] && { [ -n "$RESTORE_TS" ] || [ "$LIST_BACKUPS" = 1 ]; }; then
+    die "-C/-U 不能和 -R、-l 同时使用"
+fi
+if [ -n "$SHOW_KEYS" ]; then
+    { [ "$MODE" = config ] || [ -n "$RESTORE_TS" ] || [ "$LIST_BACKUPS" = 1 ]; } \
+        && die "-S 不能和 -C/-U、-R、-l 同时使用"
+    if [ "$SHOW_KEYS" != all ]; then
+        for k in $(echo "$SHOW_KEYS" | tr ',' ' '); do
+            echo "$k" | grep -qE '^[A-Za-z_][A-Za-z0-9_.]*$' || die "配置项名不合法: $k"
+        done
+    fi
+fi
+
 if [ -n "$RESTORE_TS" ]; then
     [ "$LIST_BACKUPS" = 1 ] && die "-l 和 -R 不能同时使用"
     # 时间戳会拼进远端路径，只接受固定格式
@@ -174,7 +231,9 @@ if [ -n "$RESTORE_TS" ]; then
         || die "-R 需要形如 20260927_082927 的时间戳或 last: $RESTORE_TS"
 fi
 
-if [ -n "$RESTORE_TS" ] || [ "$LIST_BACKUPS" = 1 ]; then
+if [ "$MODE" = config ] || [ -n "$SHOW_KEYS" ]; then
+    DEPLOY_DIRS="$REQUIRED_DIRS"    # 不换目录，只是远端脚本要求有值
+elif [ -n "$RESTORE_TS" ] || [ "$LIST_BACKUPS" = 1 ]; then
     # 切换时处理全部目录：备份里没有的可选目录，说明旧版本没有它，会被移走
     DEPLOY_DIRS="$REQUIRED_DIRS $OPTIONAL_DIRS"
 else
@@ -239,8 +298,40 @@ if [ "$LIST_BACKUPS" = 1 ]; then
     exit $rc
 fi
 
+# 打印配置文件里的配置项；用法: bash -s -- <配置文件> <key,key|all>
+SHOW_CONF_SH='
+conf="$1"; keys="$2"
+[ -f "$conf" ] || { echo "    (配置文件不存在: $conf)"; exit 1; }
+if [ "$keys" = all ]; then
+    grep -E "^[[:space:]]*[A-Za-z_][A-Za-z0-9_.]*[[:space:]]*=" "$conf" | sed "s/^[[:space:]]*/    /"
+    exit 0
+fi
+for k in $(echo "$keys" | tr "," " "); do
+    re="$(echo "$k" | sed "s/\./\\\\./g")"
+    lines="$(grep -E "^[[:space:]]*$re[[:space:]]*=" "$conf")"
+    if [ -z "$lines" ]; then
+        echo "    $k  (未设置，使用默认值)"
+    else
+        echo "$lines" | sed "s/^[[:space:]]*/    /"
+        [ "$(echo "$lines" | wc -l)" -gt 1 ] && echo "    ^ $k 出现多次"
+    fi
+done
+exit 0
+'
+
+if [ -n "$SHOW_KEYS" ]; then
+    log "配置文件 : $REMOTE_FE/conf/fe.conf"
+    rc=0
+    for host in "${HOST_LIST[@]}"; do
+        echo "  $host:"
+        $SSH_CMD "$SSH_TARGET_PREFIX$host" bash -s -- "'$REMOTE_FE/conf/fe.conf'" "'$SHOW_KEYS'" \
+            <<< "$SHOW_CONF_SH" || { echo "    (失败)"; rc=1; }
+    done
+    exit $rc
+fi
+
 LOCAL_PATHS=()
-if [ -z "$RESTORE_TS" ]; then
+if [ "$MODE" = deploy ] && [ -z "$RESTORE_TS" ]; then
     for d in $DEPLOY_DIRS; do
         LOCAL_PATHS+=("$LOCAL_FE/$d")
     done
@@ -248,7 +339,16 @@ if [ -z "$RESTORE_TS" ]; then
 fi
 
 # ---- 部署计划 ----
-if [ "$RESTORE_TS" = last ]; then
+if [ "$MODE" = config ]; then
+    log "修改配置 : $REMOTE_FE/conf/fe.conf  (原文件备份为 fe.conf.bak.${TS}，保留最近 $BACKUP_KEEP 份)"
+    printf '%s' "$CONF_EDITS" | while IFS=$'\t' read -r op key value; do
+        if [ "$op" = set ]; then
+            log "           $key = $value"
+        else
+            log "           $key  (注释掉，恢复默认值)"
+        fi
+    done
+elif [ "$RESTORE_TS" = last ]; then
     log "切换到   : 各机器 $REMOTE_FE/deploy_backup/ 下最近的一份备份  (先在远端复制到中转目录，不上传)"
 elif [ -n "$RESTORE_TS" ]; then
     log "切换到   : 远端备份 $REMOTE_FE/deploy_backup/$RESTORE_TS  (先在远端复制到中转目录，不上传)"
@@ -258,18 +358,22 @@ fi
 log "远端目录 : $REMOTE_FE"
 log "中转目录 : $STAGE  (部署结束后删除)"
 log "目标机器 : ${HOST_LIST[*]}  (按此顺序，Leader 应在最后)"
-log "备份目录 : $REMOTE_FE/deploy_backup/$TS (保留最近 $BACKUP_KEEP 份)"
+[ "$MODE" = deploy ] && log "备份目录 : $REMOTE_FE/deploy_backup/$TS (保留最近 $BACKUP_KEEP 份)"
 log "参数     : STOP_TIMEOUT=${STOP_TIMEOUT}s START_TIMEOUT=${START_TIMEOUT}s" \
     "STABLE_WAIT=${STABLE_WAIT}s FORCE_KILL=$FORCE_KILL ROLLBACK=$ROLLBACK HEALTH_PORT=$HEALTH_PORT"
 
-if [ "$DRY_RUN" = 1 ]; then
+# 改配置的 dry-run 要到各机器上算 diff，不在这里退出
+if [ "$DRY_RUN" = 1 ] && [ "$MODE" != config ]; then
     log "dry-run 模式，未执行任何操作"
     exit 0
 fi
 
-if [ "$ASSUME_YES" != 1 ]; then
+if [ "$ASSUME_YES" != 1 ] && [ "$DRY_RUN" != 1 ]; then
+    what=""
+    [ -n "$RESTORE_TS" ] && what=" 并切换到备份 $RESTORE_TS"
+    [ "$MODE" = config ] && what=" 并修改配置（无变化的机器不重启）"
     printf '将按顺序重启以上 %d 台机器的 FE%s（Leader 应在最后），确认继续? [y/N] ' \
-        "${#HOST_LIST[@]}" "${RESTORE_TS:+ 并切换到备份 $RESTORE_TS}"
+        "${#HOST_LIST[@]}" "$what"
     read -r answer
     case "$answer" in
         y|Y|yes|YES) ;;
@@ -282,6 +386,8 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 REMOTE_SH="$WORK_DIR/remote_deploy.sh"
+CONF_EDITS_FILE="$WORK_DIR/conf_edits"
+printf '%s' "$CONF_EDITS" > "$CONF_EDITS_FILE"
 cat > "$REMOTE_SH" <<'REMOTE_EOF'
 #!/bin/bash
 # 由 deploy_fe.sh 上传并在目标机器上执行
@@ -289,12 +395,17 @@ set -uo pipefail
 
 : "${SR_HOME:?SR_HOME 未传入}" "${STAGE:?STAGE 未传入}" "${TS:?TS 未传入}" \
   "${DEPLOY_DIRS:?DEPLOY_DIRS 未传入}"
+MODE="${MODE:-deploy}"     # deploy: 换目录；config: 改配置文件
+CONF_DRY_RUN="${CONF_DRY_RUN:-0}"
 NEW="$STAGE"          # scp 上传的新版本目录就在这里
 BACKUP_DIR="$SR_HOME/deploy_backup/$TS"
 START_SH="bin/start_fe.sh"
 STOP_SH="bin/stop_fe.sh"
 CONF_FILE="conf/fe.conf"
 OUT_FILE="log/fe.out"
+CONF_EDITS_FILE="$STAGE/conf_edits"
+NEW_CONF="$STAGE/new.conf"
+CONF_BAK="$SR_HOME/$CONF_FILE.bak.$TS"
 
 log() {
     echo "  [$(hostname -s) $(date '+%H:%M:%S')] $*"
@@ -441,9 +552,65 @@ verify_fe() {
     done
 }
 
+# 按 conf_edits 生成新配置：set 替换第一处生效的 key（其余同名行注释掉），
+# 没有则追加到末尾；unset 注释掉所有同名行。注释行不动。
+apply_conf_edits() {
+    awk -v ts="$TS" '
+    FNR == NR {
+        i = index($0, "\t"); op = substr($0, 1, i - 1); rest = substr($0, i + 1)
+        j = index(rest, "\t")
+        if (j) { k = substr(rest, 1, j - 1); v = substr(rest, j + 1) } else { k = rest; v = "" }
+        if (!(k in kop)) order[++n] = k
+        kop[k] = op; kval[k] = v
+        next
+    }
+    {
+        if (match($0, /^[ \t]*[A-Za-z_][A-Za-z0-9_.]*[ \t]*=/)) {
+            k = substr($0, RSTART, RLENGTH - 1); gsub(/[ \t]/, "", k)
+            if (k in kop) {
+                if (kop[k] == "set" && !(k in done)) { print k " = " kval[k]; done[k] = 1; next }
+                print "# " $0 "    # commented out by deploy " ts
+                next
+            }
+        }
+        print
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            k = order[i]
+            if (kop[k] == "set" && !(k in done)) print k " = " kval[k]
+        }
+    }
+    ' "$CONF_EDITS_FILE" "$SR_HOME/$CONF_FILE" > "$NEW_CONF"
+}
+
+# 改配置失败：恢复原配置并重新拉起
+conf_rollback() {
+    log "开始回滚配置: $CONF_BAK -> $CONF_FILE"
+    [ -f "$CONF_BAK" ] || { log "配置备份不存在，无法回滚，请人工处理"; return 1; }
+    if ! stop_fe 60; then
+        log "回滚前进程未退出，kill -9 $(fe_pids)"
+        kill -9 $(fe_pids) 2>/dev/null
+        sleep 5
+    fi
+    cp "$CONF_BAK" "$SR_HOME/$CONF_FILE" || { log "恢复配置失败"; return 1; }
+    start_fe
+    if verify_fe; then
+        log "回滚完成，已恢复原配置"
+    else
+        log "回滚后启动仍失败，请人工处理"
+        return 1
+    fi
+    return 0
+}
+
 # 回滚：丢弃新版本，恢复备份目录里的旧目录，并重新拉起
 rollback() {
     local d
+    if [ "$MODE" = config ]; then
+        conf_rollback
+        return
+    fi
     log "开始回滚到备份: $BACKUP_DIR"
     if [ ! -d "$BACKUP_DIR/bin" ] || [ ! -d "$BACKUP_DIR/lib" ]; then
         log "备份不完整，无法回滚，请人工处理: $BACKUP_DIR"
@@ -476,6 +643,8 @@ fail_after_backup() {
     dump_fe_out
     if [ "$ROLLBACK" = "1" ]; then
         rollback
+    elif [ "$MODE" = config ]; then
+        log "ROLLBACK=0，未回滚。原配置在 $CONF_BAK"
     else
         log "ROLLBACK=0，未回滚。备份在 $BACKUP_DIR"
     fi
@@ -489,13 +658,28 @@ fail_after_backup() {
 [ -f "$SR_HOME/$CONF_FILE" ] || die "缺少配置文件: $SR_HOME/${CONF_FILE}（目录是不是选错了?）"
 [ -d "$SR_HOME/lib" ] || die "缺少目录: $SR_HOME/lib"
 
-for d in bin lib; do
-    [ -d "$NEW/$d" ] || die "上传的 $d 目录不存在: $NEW/$d"
-done
-[ -f "$NEW/$START_SH" ] || die "上传内容缺少 $START_SH"
-[ -f "$NEW/lib/starrocks-fe.jar" ] || die "上传内容缺少 lib/starrocks-fe.jar"
-chmod +x "$NEW"/bin/*.sh 2>/dev/null
-log "待部署的 $DEPLOY_DIRS 已就绪于 $NEW"
+if [ "$MODE" = config ]; then
+    [ -f "$CONF_EDITS_FILE" ] || die "缺少配置修改列表: $CONF_EDITS_FILE"
+    apply_conf_edits || die "生成新配置失败"
+    if cmp -s "$SR_HOME/$CONF_FILE" "$NEW_CONF"; then
+        log "配置无变化，跳过重启"
+        exit 0
+    fi
+    log "配置 diff ($CONF_FILE):"
+    diff -u "$SR_HOME/$CONF_FILE" "$NEW_CONF" | tail -n +3 | sed 's/^/  | /'
+    if [ "$CONF_DRY_RUN" = 1 ]; then
+        log "dry-run，未修改"
+        exit 0
+    fi
+else
+    for d in bin lib; do
+        [ -d "$NEW/$d" ] || die "上传的 $d 目录不存在: $NEW/$d"
+    done
+    [ -f "$NEW/$START_SH" ] || die "上传内容缺少 $START_SH"
+    [ -f "$NEW/lib/starrocks-fe.jar" ] || die "上传内容缺少 lib/starrocks-fe.jar"
+    chmod +x "$NEW"/bin/*.sh 2>/dev/null
+    log "待部署的 $DEPLOY_DIRS 已就绪于 $NEW"
+fi
 
 PIDS_BEFORE="$(fe_pids)"
 
@@ -539,6 +723,15 @@ if ! stop_fe "$STOP_TIMEOUT"; then
 fi
 log "StarRocksFE 已完全退出"
 
+if [ "$MODE" = config ]; then
+    # ---- 3/4. 备份并写入配置 ----
+    # cp -p 保留原文件属性；写回用 cat 覆盖内容，不改变原文件的属主和权限
+    cp -p "$SR_HOME/$CONF_FILE" "$CONF_BAK" || die "备份配置失败: $CONF_BAK"
+    if ! cat "$NEW_CONF" > "$SR_HOME/$CONF_FILE"; then
+        fail_after_backup "写入新配置失败"
+    fi
+    log "已写入新配置，原配置备份为 $CONF_BAK"
+else
 # ---- 3. 备份旧目录 ----
 mkdir -p "$BACKUP_DIR" || die "无法创建备份目录: $BACKUP_DIR"
 for d in $DEPLOY_DIRS; do
@@ -569,6 +762,7 @@ for d in $DEPLOY_DIRS; do
     fi
 done
 log "新的 $DEPLOY_DIRS 已就位"
+fi
 
 # ---- 5. 启动 ----
 if ! start_fe; then
@@ -581,7 +775,15 @@ if ! verify_fe; then
 fi
 
 # ---- 7. 清理旧备份 ----
-if [ "$BACKUP_KEEP" -gt 0 ]; then
+if [ "$BACKUP_KEEP" -gt 0 ] && [ "$MODE" = config ]; then
+    old="$(ls -1dt "$SR_HOME/$CONF_FILE".bak.* 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)))"
+    if [ -n "$old" ]; then
+        echo "$old" | while read -r f; do
+            log "清理旧配置备份: $f"
+            rm -f "$f"
+        done
+    fi
+elif [ "$BACKUP_KEEP" -gt 0 ]; then
     old="$(ls -1dt "$SR_HOME/deploy_backup"/*/ 2>/dev/null | tail -n +$((BACKUP_KEEP + 1)))"
     if [ -n "$old" ]; then
         echo "$old" | while read -r d; do
@@ -622,7 +824,13 @@ deploy_one() {
         return 1
     fi
 
-    if [ -n "$RESTORE_TS" ]; then
+    if [ "$MODE" = config ]; then
+        if ! $SCP_CMD "$REMOTE_SH" "$CONF_EDITS_FILE" "$target:$STAGE/"; then
+            log "$host: 上传失败"
+            $SSH_CMD "$target" "rm -rf '$STAGE'" >/dev/null 2>&1
+            return 1
+        fi
+    elif [ -n "$RESTORE_TS" ]; then
         # 复制而不是移动：切换失败回滚时备份仍然完好
         local picked
         log "$host: 复制备份 $RESTORE_TS -> $STAGE/"
@@ -646,6 +854,7 @@ deploy_one() {
     local rc=0
     $SSH_CMD "$target" \
         "SR_HOME='$REMOTE_FE' STAGE='$STAGE' TS='$TS' DEPLOY_DIRS='$DEPLOY_DIRS' \
+         MODE='$MODE' CONF_DRY_RUN='$DRY_RUN' \
          STOP_TIMEOUT='$STOP_TIMEOUT' START_TIMEOUT='$START_TIMEOUT' \
          STABLE_WAIT='$STABLE_WAIT' FORCE_KILL='$FORCE_KILL' \
          ROLLBACK='$ROLLBACK' HEALTH_PORT='$HEALTH_PORT' \

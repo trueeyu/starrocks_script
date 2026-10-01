@@ -203,6 +203,38 @@ normal sequence from step 2 on: stop, back up the **current** version as a new
 `<ts>`, swap, start, verify, roll back on failure. Because the current version
 is saved too, `-R last` right after a switch switches straight back.
 
+#### Viewing and changing the config
+
+```bash
+# Show keys from conf/<role>.conf on each host (or -S all for every set key)
+./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -S mem_limit,sys_log_level
+
+# Preview the per-host diff, then apply and restart
+./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -C mem_limit=80% -U sys_log_level -n
+./deploy_be.sh -d /home/disk1/sr/be -f hosts.txt -u sr -C mem_limit=80% -U sys_log_level
+```
+
+`-S` reads the config **file**: keys that are not set are reported as using
+the default, keys set more than once are flagged. A value changed at runtime
+(`update_config` on BE, `ADMIN SET FRONTEND CONFIG` on FE) is not visible
+there.
+
+`-C key=value` and `-U key` can be repeated and combined; no `-s` is needed.
+On each host the new `conf/<role>.conf` is computed first and its diff
+printed:
+
+- `-C` replaces the first active `key = …` line (other active lines for the
+  same key are commented out) or appends `key = value` if the key is not set.
+  Values may contain spaces and `=`, e.g. `-C 'JAVA_OPTS="-Xmx8g -Dx=y"'`.
+- `-U` comments out every active line for the key, so the default applies.
+- Commented-out lines are left alone.
+
+A host whose config would not change is skipped without a restart. Otherwise:
+stop, copy the file to `conf/<role>.conf.bak.<ts>` (newest `BACKUP_KEEP`
+kept), write the new content in place (owner and mode unchanged), start,
+verify — and on failure put the old file back and restart. With `-n` only the
+diffs are printed.
+
 Options:
 
 | Option | Purpose |
@@ -220,6 +252,9 @@ Options:
 | `-n` | dry run: print the plan only |
 | `-l` | list the backups on each host |
 | `-R <ts>` | switch to backup `<ts>` (from `-l`), or `last` for the newest |
+| `-C <key=value>` | set a config key and restart (repeatable) |
+| `-U <key>` | comment out a config key and restart (repeatable) |
+| `-S <keys\|all>` | show config keys from the config file |
 
 Env overrides:
 
@@ -259,6 +294,10 @@ backup and rollback — adapted to the FE.
 # List backups / switch to the newest one (see "Switching to an earlier version")
 ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -l
 ./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -R last
+
+# Show / change config and restart (see "Viewing and changing the config")
+./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -S sys_log_level
+./deploy_fe.sh -d /home/disk1/sr/fe -f fe_hosts.txt -u sr -C sys_log_level=WARN
 ```
 
 **Order matters.** Hosts are deployed strictly in the order given, and the
@@ -294,6 +333,8 @@ Differences from `deploy_be.sh`:
 - Only `bin/`/`lib/` etc. are backed up, not `meta/`. If a new version has
   already rewritten the image, rolling back to an older version may not be
   able to read it — back up `meta/` yourself before a version upgrade.
+- `-S` / `-C` / `-U` work on `conf/fe.conf` exactly as in `deploy_be.sh`,
+  restarting the FEs one at a time in the order given.
 - `-l` / `-R <ts|last>` switch to an earlier version exactly as in
   `deploy_be.sh` — and the `meta/` caveat above applies to them in full.
   Switching across versions is a downgrade: check the StarRocks downgrade
